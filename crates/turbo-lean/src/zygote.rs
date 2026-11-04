@@ -3196,7 +3196,7 @@ pub(crate) fn ensure_zygote_binary_at(
     let env_vars = &env_vars;
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote:v4:absolute-tools:");
+    hasher.update(b"turbo-zygote:v5:hybrid-opt-tools:");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(lean_bin.to_string_lossy().as_bytes());
     if let Some(tc) = env_vars.get("ELAN_TOOLCHAIN") {
@@ -3208,8 +3208,19 @@ pub(crate) fn ensure_zygote_binary_at(
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
     let bin_dir = store_root.join("fastcheck_bins");
     fs::create_dir_all(&bin_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(m) = fs::symlink_metadata(&bin_dir) {
+            if m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 != 0 {
+                let mut p = m.permissions();
+                p.set_mode(0o700);
+                let _ = fs::set_permissions(&bin_dir, p);
+            }
+        }
+    }
     let cached_bin = bin_dir.join(&bin_name);
-    if cached_bin.exists() {
+    if owned_private_file(&cached_bin) {
         return Ok(cached_bin);
     }
 
@@ -3224,14 +3235,17 @@ pub(crate) fn ensure_zygote_binary_at(
         })
         .flatten();
 
-    if cached_bin.exists() {
+    if owned_private_file(&cached_bin) {
         return Ok(cached_bin);
+    }
+    if cached_bin.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(&cached_bin);
     }
     if let Some(shared_bin) = shared_bin.as_ref().filter(|b| owned_private_file(b)) {
         let tmp_copy = bin_dir.join(format!(".{}.{}.tmp", bin_name, next_tmp_id()));
         if fs::hard_link(shared_bin, &tmp_copy).is_ok() || fs::copy(shared_bin, &tmp_copy).is_ok() {
             let _ = fs::rename(&tmp_copy, &cached_bin);
-            if cached_bin.exists() {
+            if owned_private_file(&cached_bin) {
                 return Ok(cached_bin);
             }
         }
@@ -3274,11 +3288,11 @@ pub(crate) fn ensure_zygote_binary_at(
     };
     compile_env.insert("LEAN_PATH".to_string(), scratch_lp);
 
-    let mut c_files = Vec::with_capacity(3);
-    for (stem, src, emit_olean) in [
-        ("Blake3", BLAKE3_LEAN_SRC, true),
-        ("StatementHash", STATEMENT_HASH_LEAN_SRC, true),
-        ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false),
+    let mut obj_files = Vec::with_capacity(3);
+    for (stem, src, emit_olean, c_opt) in [
+        ("Blake3", BLAKE3_LEAN_SRC, true, "-O3"),
+        ("StatementHash", STATEMENT_HASH_LEAN_SRC, true, "-O3"),
+        ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false, "-O0"),
     ] {
         let lean_file = if emit_olean {
             scratch_pkg.join(format!("{stem}.lean"))
@@ -3286,6 +3300,7 @@ pub(crate) fn ensure_zygote_binary_at(
             scratch_dir.join(format!("ZygoteWorker_{tmp_id}.lean"))
         };
         let c_file = scratch_dir.join(format!("{stem}_{tmp_id}.c"));
+        let obj_file = scratch_dir.join(format!("{stem}_{tmp_id}.o"));
         fs::write(&lean_file, src)?;
         let mut cmd = Command::new(lean_bin);
         cmd.arg(format!("--root={}", scratch_dir.display()));
@@ -3301,18 +3316,32 @@ pub(crate) fn ensure_zygote_binary_at(
             .output()
             .with_context(|| format!("Failed to compile {stem}.lean to C"))?;
         if !out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("`lean -c` failed on {stem}.lean:\n{stdout}{stderr}");
+        }
+        let c_out = Command::new(leanc_bin)
+            .arg(c_opt)
+            .arg("-c")
+            .arg(&c_file)
+            .arg("-o")
+            .arg(&obj_file)
+            .current_dir(&scratch_dir)
+            .envs(&compile_env)
+            .output()
+            .with_context(|| format!("Failed to compile {stem}.c via `leanc {c_opt} -c`"))?;
+        if !c_out.status.success() {
             anyhow::bail!(
-                "`lean -c` failed on {stem}.lean:\n{}",
-                String::from_utf8_lossy(&out.stderr)
+                "`leanc {c_opt} -c` failed on {stem}.c:\n{}",
+                String::from_utf8_lossy(&c_out.stderr)
             );
         }
-        c_files.push(c_file);
+        obj_files.push(obj_file);
     }
 
     let mut link_cmd = Command::new(leanc_bin);
-    link_cmd.arg("-O3");
-    for c_file in &c_files {
-        link_cmd.arg(c_file);
+    for obj_file in &obj_files {
+        link_cmd.arg(obj_file);
     }
     link_cmd
         .arg("-lleanshared")
@@ -3419,24 +3448,40 @@ pub(crate) struct PinnedFfiPackage {
     pub decls: &'static [(&'static str, &'static str)],
 }
 
-pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[PinnedFfiPackage {
-    name: "lean-sys",
-    url: "https://github.com/Th0rgal/lean-sys.git",
-    rev: "077775ba387f1eeb2976cb8763b4633b8d5ce313",
-    module: "LeanSys.Posix",
-    rel_src: "LeanSys/Posix.lean",
-    src_sha256: "35aacd3f54a985e2365de92eea17d167a2945538c0533cebf2a44338936ce2d8",
-    decls: &[
-        ("LeanSys.Posix.rawOpenFlock", "leansys_open_flock"),
-        ("LeanSys.Posix.rawFsCloneOrLink", "leansys_fs_clone_or_link"),
-        ("LeanSys.Posix.rawWriteAll", "leansys_write_all"),
-        ("LeanSys.Posix.rawPreadBa", "leansys_pread_ba"),
-        ("LeanSys.Posix.rawSpawnGroup", "leansys_spawn_group"),
-        ("LeanSys.Posix.rawKillWaitGroup", "leansys_kill_wait_group"),
-        ("LeanSys.Posix.rawNetListen", "leansys_net_listen"),
-        ("LeanSys.Posix.rawNetAcceptPoll", "leansys_net_accept_poll"),
-    ],
-}];
+pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[
+    PinnedFfiPackage {
+        name: "lean-sys",
+        url: "https://github.com/Th0rgal/lean-sys.git",
+        rev: "077775ba387f1eeb2976cb8763b4633b8d5ce313",
+        module: "LeanSys.Posix",
+        rel_src: "LeanSys/Posix.lean",
+        src_sha256: "35aacd3f54a985e2365de92eea17d167a2945538c0533cebf2a44338936ce2d8",
+        decls: &[
+            ("LeanSys.Posix.rawOpenFlock", "leansys_open_flock"),
+            ("LeanSys.Posix.rawFsCloneOrLink", "leansys_fs_clone_or_link"),
+            ("LeanSys.Posix.rawWriteAll", "leansys_write_all"),
+            ("LeanSys.Posix.rawPreadBa", "leansys_pread_ba"),
+            ("LeanSys.Posix.rawSpawnGroup", "leansys_spawn_group"),
+            ("LeanSys.Posix.rawKillWaitGroup", "leansys_kill_wait_group"),
+            ("LeanSys.Posix.rawNetListen", "leansys_net_listen"),
+            ("LeanSys.Posix.rawNetAcceptPoll", "leansys_net_accept_poll"),
+        ],
+    },
+    PinnedFfiPackage {
+        name: "evmyul",
+        url: "https://github.com/lfglabs-dev/EVMYulLean.git",
+        rev: "a132798069be50e8b03f88d6a96f2618c128ae7f",
+        module: "EvmYul.FFI.ffi",
+        rel_src: "EvmYul/FFI/ffi.lean",
+        src_sha256: "c0b6b455399a476fd3c5be3fd3e1df5788a112dd92b520397512d073b6317562",
+        decls: &[
+            ("ffi.sha256", "sha256"),
+            ("ffi.BLAKE2Compress", "blake2compressb64"),
+            ("ffi.ByteArray.zeroes", "memset_zero"),
+            ("ffi.keccak256", "keccak256"),
+        ],
+    },
+];
 
 pub(crate) fn pinned_ffi_allow_args(
     cfg: &crate::module_builder::ProjectConfig,
@@ -3517,35 +3562,335 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     let mut sorted: Vec<String> = mod_names.to_vec();
     sorted.sort();
     sorted.dedup();
-    for chunk in sorted.chunks(audit_batch_size()) {
-        audit_compiled_module_batch(
-            store,
+    // Pre-replay multi-module batches via topological `--kernel-replay-closure` slices so
+    // `--audit-modules` can pass `--skip-child-replay` instead of spawning one
+    // `--kernel-replay-module` child per audited module.
+    let pre_replayed = if sorted.len() > 1 {
+        kernel_replay_modules_exec(
+            &store.root,
             cfg,
-            chunk,
+            &sorted,
             lean_path_env,
             extra_ro_binds,
             is_untrusted,
+        )?;
+        true
+    } else {
+        false
+    };
+    let batch_sz = if pre_replayed && !is_untrusted {
+        audit_batch_size().max(32)
+    } else {
+        audit_batch_size()
+    };
+    let chunks: Vec<&[String]> = sorted.chunks(batch_sz).collect();
+    if is_untrusted || chunks.len() <= 1 {
+        for chunk in chunks {
+            audit_compiled_module_batch_with_replay_flag(
+                store,
+                cfg,
+                chunk,
+                lean_path_env,
+                extra_ro_binds,
+                is_untrusted,
+                pre_replayed,
+            )?;
+        }
+        return Ok(());
+    }
+    let parallelism = std::env::var("TURBO_LEAN_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            if pre_replayed {
+                cores
+            } else {
+                cores.div_ceil(4).max(1)
+            }
+        })
+        .min(chunks.len());
+    if parallelism <= 1 {
+        for chunk in chunks {
+            audit_compiled_module_batch_with_replay_flag(
+                store,
+                cfg,
+                chunk,
+                lean_path_env,
+                extra_ro_binds,
+                false,
+                pre_replayed,
+            )?;
+        }
+        return Ok(());
+    }
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let _ = ensure_zygote_binary_at(&store.root, &cfg.lean_bin, &bootstrap_env)?;
+    let store_root = store.root.clone();
+    let dirs_for_record: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    let record_lock: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            s.spawn(|| loop {
+                if first_err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                    break;
+                }
+                let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= chunks.len() {
+                    break;
+                }
+                let chunk = chunks[idx];
+                let res = audit_compiled_module_batch_exec(
+                    &store_root,
+                    cfg,
+                    chunk,
+                    lean_path_env,
+                    extra_ro_binds,
+                    false,
+                    pre_replayed,
+                );
+                let res = res.and_then(|()| {
+                    if extra_ro_binds.is_empty() {
+                        let all_on_lean_path = chunk.iter().all(|m| {
+                            let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
+                            let rel_olean = format!("{}.olean", rel_slash);
+                            dirs_for_record
+                                .iter()
+                                .map(|d| d.join(&rel_olean))
+                                .any(|p| p.is_file())
+                        });
+                        if all_on_lean_path && !chunk.is_empty() {
+                            let _guard = record_lock
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("audit record mutex poisoned"))?;
+                            let worker_store = TurboStore::open(Some(&store_root))?;
+                            record_replayed_modules_in_store(
+                                &worker_store,
+                                cfg,
+                                chunk,
+                                lean_path_env,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(e) = res {
+                    if let Ok(mut g) = first_err.lock() {
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                    }
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().ok().flatten() {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Unified closure replay + soundness audit for `certify_head_statement_modules_and_replay` in
+/// trusted mode: replays `audit_mods ∪ replay_only_mods` together in a single topological closure
+/// batch pass so interleaved packages (e.g. `Verity.Core` -> `Compiler.*` -> `Verity.Macro`) do not
+/// taint/fragment each other's closure slices, then runs `--audit-modules --skip-child-replay` over
+/// `audit_mods` only and persists replay authority for both sets (including `extra_root_lib`
+/// overlay `.olean` roots).
+pub(crate) fn replay_and_audit_modules_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    audit_mods: &[String],
+    replay_only_mods: &[String],
+    lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
+) -> Result<()> {
+    let mut sorted_audit: Vec<String> = audit_mods.to_vec();
+    sorted_audit.sort();
+    sorted_audit.dedup();
+    let mut union_mods: Vec<String> =
+        Vec::with_capacity(sorted_audit.len() + replay_only_mods.len());
+    union_mods.extend(sorted_audit.iter().cloned());
+    union_mods.extend(replay_only_mods.iter().cloned());
+    union_mods.sort();
+    union_mods.dedup();
+    if union_mods.is_empty() {
+        return Ok(());
+    }
+    kernel_replay_modules_exec(&store.root, cfg, &union_mods, lean_path_env, &[], false)?;
+    if !sorted_audit.is_empty() {
+        let batch_sz = audit_batch_size().max(32);
+        let chunks: Vec<&[String]> = sorted_audit.chunks(batch_sz).collect();
+        let parallelism = std::env::var("TURBO_LEAN_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+            .min(chunks.len());
+        if parallelism <= 1 {
+            for chunk in chunks {
+                audit_compiled_module_batch_exec(
+                    &store.root,
+                    cfg,
+                    chunk,
+                    lean_path_env,
+                    &[],
+                    false,
+                    true,
+                )?;
+            }
+        } else {
+            let bootstrap_env = build_auditor_bootstrap_env(cfg);
+            let _ = ensure_zygote_binary_at(&store.root, &cfg.lean_bin, &bootstrap_env)?;
+            let store_root = store.root.clone();
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+            std::thread::scope(|s| {
+                for _ in 0..parallelism {
+                    s.spawn(|| loop {
+                        if first_err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                            break;
+                        }
+                        let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= chunks.len() {
+                            break;
+                        }
+                        if let Err(e) = audit_compiled_module_batch_exec(
+                            &store_root,
+                            cfg,
+                            chunks[idx],
+                            lean_path_env,
+                            &[],
+                            false,
+                            true,
+                        ) {
+                            if let Ok(mut g) = first_err.lock() {
+                                if g.is_none() {
+                                    *g = Some(e);
+                                }
+                            }
+                            break;
+                        }
+                    });
+                }
+            });
+            if let Some(e) = first_err.into_inner().ok().flatten() {
+                return Err(e);
+            }
+        }
+    }
+    record_replayed_modules_in_store_with_extra_root(
+        store,
+        cfg,
+        &union_mods,
+        lean_path_env,
+        extra_root_lib,
+    )?;
+    if !sorted_audit.is_empty() {
+        record_audited_modules_in_store_with_extra_root(
+            store,
+            cfg,
+            &sorted_audit,
+            lean_path_env,
+            extra_root_lib,
         )?;
     }
     Ok(())
 }
 
-fn record_replayed_modules_in_store(
+pub(crate) fn compute_module_audit_policy_digest(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+) -> String {
+    let base_policy = crate::splitter::current_kernel_policy_digest();
+    let ffi_args = pinned_ffi_allow_args(cfg, &[mod_name.to_string()]);
+    if base_policy.is_empty() && ffi_args.is_empty() {
+        return String::new();
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-audit-policy-v1\n");
+    h.update(&(base_policy.len() as u64).to_le_bytes());
+    h.update(base_policy.as_bytes());
+    for a in &ffi_args {
+        h.update(&(a.len() as u64).to_le_bytes());
+        h.update(a.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+pub(crate) fn record_audited_modules_in_store_with_extra_root(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
 ) -> Result<()> {
-    let disallowed_roots = crate::module_builder::project_disallowed_replay_store_roots(cfg);
-    let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    let mut replay_batch = crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
+        store,
+        cfg,
+        lean_path_env,
+        extra_root_lib,
+    );
     for m in mod_names {
-        let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
-        let rel_olean = format!("{}.olean", rel_slash);
-        let Some(olean_path) = dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.is_file())
-        else {
+        let Some(olean_path) = replay_batch.resolve_module_olean(m) else {
+            anyhow::bail!(
+                "Audited module `{}` missing `.olean` along auditor LEAN_PATH: fail-closed",
+                m
+            );
+        };
+        let dig = crate::module_builder::compute_replayed_olean_ilean_digest(&olean_path)
+            .with_context(|| {
+                format!(
+                    "Failed to compute post-audit `.olean`+`.ilean` digest for `{}`",
+                    m
+                )
+            })?;
+        let env_dig = replay_batch
+            .compute_env_digest(cfg, lean_path_env, &olean_path)
+            .with_context(|| {
+                format!(
+                    "Failed to compute post-audit transitive import environment digest for `{}`",
+                    m
+                )
+            })?;
+        let policy_dig = compute_module_audit_policy_digest(cfg, m);
+        store.record_kernel_audited_olean(
+            &dig,
+            &env_dig,
+            ZYGOTE_REPLAY_VERSION,
+            &cfg.lean_githash,
+            &policy_dig,
+            m,
+            replay_batch.disallowed_roots(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn record_replayed_modules_in_store_with_extra_root(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
+) -> Result<()> {
+    let mut replay_batch = crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
+        store,
+        cfg,
+        lean_path_env,
+        extra_root_lib,
+    );
+    for m in mod_names {
+        let Some(olean_path) = replay_batch.resolve_module_olean(m) else {
             anyhow::bail!(
                 "Replayed module `{}` missing `.olean` along auditor LEAN_PATH: fail-closed",
                 m
@@ -3558,58 +3903,379 @@ fn record_replayed_modules_in_store(
                     m
                 )
             })?;
-        let env_dig = crate::module_builder::compute_olean_transitive_env_digest(
-            cfg,
-            lean_path_env,
-            &olean_path,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to compute post-replay transitive import environment digest for `{}`",
-                m
-            )
-        })?;
+        let env_dig = replay_batch
+            .compute_env_digest(cfg, lean_path_env, &olean_path)
+            .with_context(|| {
+                format!(
+                    "Failed to compute post-replay transitive import environment digest for `{}`",
+                    m
+                )
+            })?;
         store.record_kernel_replayed_olean(
             &dig,
             &env_dig,
             ZYGOTE_REPLAY_VERSION,
             &cfg.lean_githash,
             m,
-            &disallowed_roots,
+            replay_batch.disallowed_roots(),
         )?;
     }
     Ok(())
 }
 
-/// Independent kernel replay (`--kernel-replay-module`, one child per module so import regions
-/// are reclaimed between modules) of trusted dependency artifacts that skip the full policy
-/// audit: their declarations are rechecked against their imports before anything imports them.
-pub(crate) fn kernel_replay_modules_with_zygote(
+fn record_replayed_modules_in_store(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
+) -> Result<()> {
+    record_replayed_modules_in_store_with_extra_root(store, cfg, mod_names, lean_path_env, None)
+}
+
+fn replay_closure_batch_size() -> usize {
+    std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(32)
+}
+
+pub(crate) fn verify_proof_irrelevant_olean_update_exec(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+    old_olean_path: &Path,
+    new_olean_path: &Path,
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+) -> Result<bool> {
+    if mod_name.trim().is_empty() || !old_olean_path.is_file() || !new_olean_path.is_file() {
+        return Ok(false);
+    }
+    let (mut cmd, timeout) =
+        kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, false)?;
+    cmd.arg("--verify-proof-irrelevant-olean-update")
+        .arg(mod_name)
+        .arg(old_olean_path)
+        .arg(new_olean_path);
+    let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, false)?;
+    Ok(out.status.success())
+}
+
+/// Compute a global topological ordering of all non-toolchain `.olean` modules transitively
+/// reachable from `mod_names`, then partition `mod_names` into topological closure slices of at
+/// most `batch_size` such that no module outside a slice transitively bridges two modules in that
+/// slice (so `importModulesCore` on the slice's frontier never imports any target in the slice).
+fn build_replay_closure_batches(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    batch_size: usize,
+) -> Result<Vec<Vec<String>>> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let tc_gh = if cfg.lean_githash.is_empty() {
+        None
+    } else {
+        Some(cfg.lean_githash.as_str())
+    };
+    let target_set: std::collections::HashSet<String> = mod_names.iter().cloned().collect();
+    let mut path_memo: std::collections::HashMap<String, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let resolve_non_tc = |m: &str,
+                          memo: &mut std::collections::HashMap<String, Option<PathBuf>>|
+     -> Result<Option<PathBuf>> {
+        if let Some(cached) = memo.get(m) {
+            return Ok(cached.clone());
+        }
+        let rel = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(m)
+        );
+        let Some(p) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            memo.insert(m.to_string(), None);
+            return Ok(None);
+        };
+        if !cfg.toolchain_lib_lean.as_os_str().is_empty()
+            && crate::module_builder::is_verified_toolchain_olean_file(
+                &cfg.toolchain_lib_lean,
+                tc_gh,
+                &p,
+            )
+        {
+            memo.insert(m.to_string(), None);
+            return Ok(None);
+        }
+        memo.insert(m.to_string(), Some(p.clone()));
+        Ok(Some(p))
+    };
+
+    // Iterative post-order DFS over all reachable non-toolchain `.olean`s for topological order.
+    enum Frame {
+        Enter(String),
+        Exit(String),
+    }
+    let mut state: std::collections::HashMap<String, u8> = std::collections::HashMap::new(); // 1=visiting, 2=done
+    let mut topo_all: Vec<String> = Vec::new();
+    let mut roots: Vec<String> = target_set.iter().cloned().collect();
+    roots.sort();
+    for root in roots {
+        if state.get(&root) == Some(&2) {
+            continue;
+        }
+        let mut stack = vec![Frame::Enter(root)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(m) => {
+                    match state.get(&m).copied() {
+                        Some(2) => continue,
+                        Some(1) => {
+                            // Import cycle: fall back to single-module batches so replayAuditedModule reports cleanly.
+                            return Ok(mod_names.iter().map(|s| vec![s.clone()]).collect());
+                        }
+                        _ => {}
+                    }
+                    let Some(path) = resolve_non_tc(&m, &mut path_memo)? else {
+                        state.insert(m, 2);
+                        continue;
+                    };
+                    let (imps, _) = crate::module_builder::read_olean_binary_imports_cached(&path)?;
+                    state.insert(m.clone(), 1);
+                    stack.push(Frame::Exit(m));
+                    for imp in imps.into_iter().rev() {
+                        if state.get(&imp.module) != Some(&2) {
+                            stack.push(Frame::Enter(imp.module));
+                        }
+                    }
+                }
+                Frame::Exit(m) => {
+                    state.insert(m.clone(), 2);
+                    topo_all.push(m);
+                }
+            }
+        }
+    }
+
+    // Scan `topo_all` in topological order while tracking `tainted` (non-batch modules that
+    // transitively import at least one module in `cur_batch`). Flushing whenever `m` imports a
+    // `tainted` module or `cur_batch.len() >= batch_size` guarantees no frontier import outside
+    // `cur_batch` can reach `cur_batch`.
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut cur_batch: Vec<String> = Vec::new();
+    let mut cur_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for m in topo_all {
+        let direct_imps: Vec<String> = if let Some(Some(p)) = path_memo.get(&m) {
+            crate::module_builder::read_olean_binary_imports_cached(p)?
+                .0
+                .into_iter()
+                .map(|i| i.module)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if target_set.contains(&m) {
+            seen_targets.insert(m.clone());
+            let touches_tainted = direct_imps.iter().any(|imp| tainted.contains(imp));
+            if !cur_batch.is_empty() && (cur_batch.len() >= batch_size || touches_tainted) {
+                batches.push(std::mem::take(&mut cur_batch));
+                cur_set.clear();
+                tainted.clear();
+            }
+            cur_set.insert(m.clone());
+            cur_batch.push(m);
+        } else if !cur_set.is_empty()
+            && direct_imps
+                .iter()
+                .any(|imp| cur_set.contains(imp) || tainted.contains(imp))
+        {
+            tainted.insert(m);
+        }
+    }
+    if !cur_batch.is_empty() {
+        batches.push(cur_batch);
+    }
+    // Any target module whose `.olean` was missing on disk (so `resolve_non_tc` returned `None`)
+    // MUST still be passed to `--kernel-replay-module` so it fails closed with the exact Lean error!
+    for m in mod_names {
+        if !seen_targets.contains(m) {
+            batches.push(vec![m.clone()]);
+        }
+    }
+    Ok(batches)
+}
+
+pub(crate) fn kernel_replay_modules_exec(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
 ) -> Result<()> {
     for m in mod_names {
         anyhow::ensure!(
             !m.trim().is_empty(),
             "Kernel replay received an empty module name: fail-closed"
         );
-        let (mut cmd, timeout) =
-            kernel_reader_command(&store.root, cfg, lean_path_env, &[], false)?;
-        cmd.args(["--kernel-replay-module", m]);
-        let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, false)
+    }
+    if mod_names.is_empty() {
+        return Ok(());
+    }
+    let worker_budget = if is_untrusted {
+        1
+    } else {
+        std::env::var("TURBO_LEAN_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+    };
+    let explicit_batch_cap = std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0);
+    let slice_cap = if is_untrusted {
+        replay_closure_batch_size().min(32)
+    } else if let Some(explicit) = explicit_batch_cap {
+        explicit
+    } else {
+        let base_cap = replay_closure_batch_size();
+        if worker_budget > 1 && mod_names.len() > worker_budget {
+            (mod_names.len() / (worker_budget * 2)).clamp(8, base_cap)
+        } else {
+            base_cap
+        }
+    };
+    let batches = build_replay_closure_batches(cfg, mod_names, lean_path_env, slice_cap)
+        .unwrap_or_else(|_| mod_names.iter().map(|s| vec![s.clone()]).collect());
+    let run_replay_slice = |slice: &[String]| -> Result<()> {
+        let (mut cmd, base_timeout) =
+            kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
+        let timeout = if slice.len() == 1 {
+            cmd.args(["--kernel-replay-module", &slice[0]]);
+            base_timeout
+        } else {
+            cmd.arg("--kernel-replay-closure");
+            cmd.args(slice.iter().map(|s| s.as_str()));
+            if is_untrusted {
+                base_timeout
+            } else {
+                base_timeout.max(std::time::Duration::from_secs(600))
+            }
+        };
+        let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, is_untrusted)
+            .context("Failed to execute independent kernel replay")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        if slice.len() == 1 {
+            anyhow::bail!(
+                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}",
+                slice[0],
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        for m in slice {
+            let (mut single_cmd, single_timeout) = kernel_reader_command(
+                store_root,
+                cfg,
+                lean_path_env,
+                extra_ro_binds,
+                is_untrusted,
+            )?;
+            single_cmd.args(["--kernel-replay-module", m]);
+            let single_out = crate::module_builder::run_command_with_timeout(
+                &mut single_cmd,
+                single_timeout,
+                is_untrusted,
+            )
             .context("Failed to execute independent kernel replay (`--kernel-replay-module`)")?;
-        anyhow::ensure!(
-            out.status.success(),
-            "[TurboLean.KernelReplay] independent kernel re-check of dependency `{}` failed (exit={}):\n{}",
-            m,
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        record_replayed_modules_in_store(store, cfg, std::slice::from_ref(m), lean_path_env)?;
+            anyhow::ensure!(
+                single_out.status.success(),
+                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}",
+                m,
+                single_out.status,
+                String::from_utf8_lossy(&single_out.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    let parallelism = if is_untrusted {
+        1
+    } else {
+        std::env::var("TURBO_LEAN_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+            .min(batches.len())
+    };
+    if parallelism <= 1 {
+        for batch in &batches {
+            run_replay_slice(batch)?;
+        }
+        return Ok(());
+    }
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let _ = ensure_zygote_binary_at(store_root, &cfg.lean_bin, &bootstrap_env)?;
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            s.spawn(|| loop {
+                if first_err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                    break;
+                }
+                let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= batches.len() {
+                    break;
+                }
+                if let Err(e) = run_replay_slice(&batches[idx]) {
+                    if let Ok(mut g) = first_err.lock() {
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                    }
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap_or(None) {
+        return Err(e);
     }
     Ok(())
+}
+
+/// Independent kernel replay (`--kernel-replay-closure` / `--kernel-replay-module`, one OS child
+/// per bounded topological slice so import regions are reclaimed between batches) of trusted
+/// dependency artifacts that skip the full policy audit: their declarations are rechecked against
+/// their frontier imports before anything imports them.
+pub(crate) fn kernel_replay_modules_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+) -> Result<()> {
+    if mod_names.is_empty() {
+        return Ok(());
+    }
+    kernel_replay_modules_exec(&store.root, cfg, mod_names, lean_path_env, &[], false)?;
+    record_replayed_modules_in_store(store, cfg, mod_names, lean_path_env)
 }
 
 pub(crate) fn build_auditor_bootstrap_env(
@@ -3717,6 +4383,8 @@ pub(crate) fn kernel_reader_command(
         for key in [
             crate::splitter::ALLOWED_AXIOMS_ENV,
             "TURBO_LEAN_ALLOWED_CSIMP",
+            "TURBO_LEAN_ALLOWED_UNSAFE",
+            "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
         ] {
             if let Ok(allow) = std::env::var(key) {
                 if !allow.trim().is_empty() {
@@ -3767,25 +4435,24 @@ pub(crate) fn kernel_reader_command(
     Ok((cmd, std::time::Duration::from_millis(timeout_ms)))
 }
 
-fn audit_compiled_module_batch(
-    store: &TurboStore,
+fn audit_compiled_module_batch_exec(
+    store_root: &Path,
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
+    skip_child_replay: bool,
 ) -> Result<()> {
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
-    let (mut cmd, timeout) = kernel_reader_command(
-        &store.root,
-        cfg,
-        lean_path_env,
-        extra_ro_binds,
-        is_untrusted,
-    )?;
+    let (mut cmd, timeout) =
+        kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
     cmd.arg("--audit-modules");
+    if skip_child_replay {
+        cmd.arg("--skip-child-replay");
+    }
     for a in pinned_ffi_allow_args(cfg, mod_names) {
         cmd.arg(a);
     }
@@ -3795,29 +4462,50 @@ fn audit_compiled_module_batch(
 
     let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, is_untrusted);
     match out.and_then(|o| parse_audit_modules_reply(&o, mod_names)) {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(_) if mod_names.len() > 1 => {
             let mid = mod_names.len() / 2;
-            audit_compiled_module_batch(
-                store,
+            audit_compiled_module_batch_exec(
+                store_root,
                 cfg,
                 &mod_names[..mid],
                 lean_path_env,
                 extra_ro_binds,
                 is_untrusted,
+                skip_child_replay,
             )?;
-            audit_compiled_module_batch(
-                store,
+            audit_compiled_module_batch_exec(
+                store_root,
                 cfg,
                 &mod_names[mid..],
                 lean_path_env,
                 extra_ro_binds,
                 is_untrusted,
-            )?;
-            return Ok(());
+                skip_child_replay,
+            )
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
+}
+
+fn audit_compiled_module_batch_with_replay_flag(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+    skip_child_replay: bool,
+) -> Result<()> {
+    audit_compiled_module_batch_exec(
+        &store.root,
+        cfg,
+        mod_names,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+        skip_child_replay,
+    )?;
     if !is_untrusted && extra_ro_binds.is_empty() {
         let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
         let all_on_lean_path = mod_names.iter().all(|m| {
@@ -3827,6 +4515,13 @@ fn audit_compiled_module_batch(
         });
         if all_on_lean_path {
             record_replayed_modules_in_store(store, cfg, mod_names, lean_path_env)?;
+            record_audited_modules_in_store_with_extra_root(
+                store,
+                cfg,
+                mod_names,
+                lean_path_env,
+                None,
+            )?;
         }
     }
     Ok(())
@@ -4234,6 +4929,17 @@ pub(crate) fn run_audited_lean_shard_at_with_types_report(
             crate::splitter::ALLOWED_AXIOMS_ENV,
             crate::splitter::extra_allowed_axiom_patterns().join(","),
         );
+    }
+    for key in [
+        "TURBO_LEAN_ALLOWED_CSIMP",
+        "TURBO_LEAN_ALLOWED_UNSAFE",
+        "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+    ] {
+        if !env_vars.contains_key(key) {
+            if let Ok(val) = std::env::var(key) {
+                auditor.env(key, val);
+            }
+        }
     }
     let parsed_shards = crate::splitter::split_lean_source(source, &[]).shards;
     let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(source, &parsed_shards)?;
@@ -12590,6 +13296,80 @@ theorem uncached_tail : 2 + 2 = 4 := rfl
                 "bisected batch audit must still reject sorryAx (untrusted={is_untrusted}): {err}"
             );
         }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_zygote_binary_at_rejects_planted_symlink_or_group_writable_cached_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_zygote_cached_bin_perm_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let store_1 = tmp_dir.join("store_1");
+        let store_2 = tmp_dir.join("store_2");
+        fs::create_dir_all(&store_1).unwrap();
+        fs::create_dir_all(&store_2).unwrap();
+
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"zp\"\n[[lean_lib]]\nname = \"Zp\"\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env_vars = build_auditor_bootstrap_env(&cfg);
+        let valid_bin = ensure_zygote_binary_at(&store_1, &cfg.lean_bin, &env_vars).unwrap();
+        let bin_name = valid_bin.file_name().unwrap().to_os_string();
+
+        let bin_dir_2 = store_2.join("fastcheck_bins");
+        fs::create_dir_all(&bin_dir_2).unwrap();
+        fs::set_permissions(&bin_dir_2, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let decoy = tmp_dir.join("decoy_bin");
+        fs::write(&decoy, b"#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let planted = bin_dir_2.join(&bin_name);
+        std::os::unix::fs::symlink(&decoy, &planted).unwrap();
+        let repaired = ensure_zygote_binary_at(&store_2, &cfg.lean_bin, &env_vars).unwrap();
+        assert_eq!(repaired, planted);
+        assert!(
+            !fs::symlink_metadata(&repaired)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "planted symlink cached_bin must be replaced with an owned regular file"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&bin_dir_2)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "fastcheck_bins directory must be tightened to 0700"
+        );
+
+        fs::write(&planted, b"corrupted").unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o775)).unwrap();
+        let repaired_2 = ensure_zygote_binary_at(&store_2, &cfg.lean_bin, &env_vars).unwrap();
+        assert!(owned_private_file(&repaired_2));
+        assert_ne!(fs::read(&repaired_2).unwrap(), b"corrupted");
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

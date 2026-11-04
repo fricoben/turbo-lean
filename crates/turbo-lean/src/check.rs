@@ -1227,17 +1227,15 @@ fn stateless_imports_replayed_in_store(
     if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
         dirs.push(cfg.toolchain_lib_lean.clone());
     }
+    let mut replay_batch =
+        crate::module_builder::ReplayLookupBatchCache::new(ro_store, &cfg, local_lean_path);
     let mut worklist = crate::module_builder::parse_header_info(active_src).imports;
     let mut seen = HashSet::new();
     while let Some(m) = worklist.pop() {
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&m)
-        );
-        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        let Some(path) = replay_batch.resolve_module_olean(&m) else {
             return false;
         };
         if crate::module_builder::is_verified_toolchain_olean_file(
@@ -1247,20 +1245,13 @@ fn stateless_imports_replayed_in_store(
         ) {
             continue;
         }
-        if !crate::module_builder::is_olean_replayed_in_store(
-            ro_store,
-            &cfg,
-            local_lean_path,
-            &path,
-        ) {
+        if !replay_batch.is_replayed_in_store(ro_store, &cfg, local_lean_path, &path) {
             return false;
         }
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok((imps, _)) = crate::module_builder::read_olean_binary_imports_cached(&path) else {
             return false;
         };
-        if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
-            worklist.extend(imps.into_iter().map(|i| i.module));
-        }
+        worklist.extend(imps.into_iter().map(|i| i.module));
     }
     true
 }
@@ -2221,7 +2212,7 @@ fn check_directory(
 
     for (lf, src_blake3, src, split) in split_entries {
         anyhow::ensure!(
-            !split.hygiene.has_checking_weakening,
+            split.hygiene.is_clean_or_deferred_to_kernel_gate(),
             "Soundness hygiene violation in {}: {:?}",
             lf.display(),
             split.hygiene.disallowed_items()
@@ -2264,9 +2255,13 @@ fn check_directory(
 
     let mut total_hits = 0usize;
     let mut uncached_files = Vec::new();
-    let mut all_uncached_hygiene_clean = true;
+    let mut deferred_kernel_gate_files = Vec::new();
     for (lf, src_blake3, src, split, file_keys, file_lean_args) in parsed_files {
         let file_hygiene_clean = split.hygiene.is_clean_for_certification();
+        if !file_hygiene_clean {
+            deferred_kernel_gate_files.push((lf, src, file_lean_args));
+            continue;
+        }
         let mut file_uncached = Vec::new();
         for (idx, shard) in split.shards.into_iter().enumerate() {
             let k = file_keys[idx].clone();
@@ -2277,10 +2272,42 @@ fn check_directory(
             }
         }
         if !file_uncached.is_empty() {
-            if !file_hygiene_clean {
-                all_uncached_hygiene_clean = false;
-            }
             uncached_files.push((lf, src_blake3, src, file_uncached, file_lean_args));
+        }
+    }
+
+    if !deferred_kernel_gate_files.is_empty() {
+        let (def_env_vars, _) = resolve_lake_env(store, canon_dir)?;
+        let def_lean_bin = resolve_lean_bin(canon_dir)?;
+        for (lf, mut src, file_lean_args) in deferred_kernel_gate_files {
+            if src.is_empty() {
+                src = fs::read_to_string(&lf).with_context(|| {
+                    format!(
+                        "Failed to read deferred policy-gated file `{}`",
+                        lf.display()
+                    )
+                })?;
+            }
+            let out = crate::zygote::run_audited_lean_shard(
+                store,
+                Path::new(&def_lean_bin),
+                &def_env_vars,
+                Some(canon_dir),
+                &src,
+                &HashSet::new(),
+                &file_lean_args,
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+            )?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                anyhow::bail!(
+                    "Directory check failed in {}:\n{}\n{}",
+                    lf.display(),
+                    stdout,
+                    stderr
+                );
+            }
         }
     }
 
@@ -2327,7 +2354,6 @@ fn check_directory(
     let pid = std::process::id();
 
     let proj_build_verified = remote_http.is_none()
-        && all_uncached_hygiene_clean
         && load_verified_project_manifest(canon_dir).is_some_and(|manifest| {
             uncached_files.iter().all(|(lf, sb, _, _, _)| {
                 !sb.is_empty()
@@ -2367,16 +2393,12 @@ fn check_directory(
         let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
         if let Some(mod_imp) = resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_lf)
         {
-            if proj_build_verified {
+            let uncached_names: HashSet<String> = file_uncached
+                .iter()
+                .map(|(_, sh)| sh.rooted_name())
+                .collect();
+            if splitter::can_use_fast_olean_import(src, &uncached_names) {
                 cross_eligible.push((mod_imp, src.as_str(), file_uncached));
-            } else {
-                let uncached_names: HashSet<String> = file_uncached
-                    .iter()
-                    .map(|(_, sh)| sh.rooted_name())
-                    .collect();
-                if splitter::can_use_fast_olean_import(src, &uncached_names) {
-                    cross_eligible.push((mod_imp, src.as_str(), file_uncached));
-                }
             }
         }
     }
@@ -4532,10 +4554,8 @@ fn check_single_file(
     let mut hits = 0usize;
     let mut uncached_shards = Vec::new();
     let mut attested_kths: HashMap<String, String> = HashMap::new();
-    if split.eligible_for_sharding
-        && split.hygiene.is_clean_for_certification()
-        && !split.shards.is_empty()
-    {
+    let hygiene_deferrable = split.hygiene.is_clean_or_deferred_to_kernel_gate();
+    if split.eligible_for_sharding && hygiene_deferrable && !split.shards.is_empty() {
         if src.is_empty() {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
@@ -4553,9 +4573,11 @@ fn check_single_file(
             attested_kths.insert(file_shard_keys[idx].clone(), att.kernel_type_hash);
         }
     }
+    let hygiene_strictly_clean = split.hygiene.is_clean_for_certification();
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
-        let is_attested_hit = cached_map.contains_key(&shard_key)
+        let is_attested_hit = hygiene_strictly_clean
+            && cached_map.contains_key(&shard_key)
             && attested_kths.get(&shard_key).is_some_and(|kth| {
                 store.has_attested_decl_receipt(&shard_key, "trusted", shard.decl_name(), kth)
             });
@@ -4570,7 +4592,7 @@ fn check_single_file(
     }
     let misses = uncached_shards.len();
 
-    if !split.hygiene.is_clean_for_certification() {
+    if !hygiene_deferrable {
         if !crate::zygote::daemon_disabled() {
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file).unwrap_or_default();
@@ -4759,7 +4781,8 @@ fn check_single_file(
         }
     }
 
-    let use_parallel_shards = split.eligible_for_sharding && !uncached_shards.is_empty();
+    let use_parallel_shards =
+        hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty();
 
     let proj_build_verified = split.hygiene.is_clean_for_certification()
         && cached_file_blake3
@@ -5321,7 +5344,8 @@ fn check_single_file(
         let mut verified_via_zygote_eval = false;
         let mut eval_stdout_text = String::new();
         let mut eval_messages: Vec<String> = Vec::new();
-        let can_use_zygote_eval = !crate::zygote::daemon_disabled()
+        let can_use_zygote_eval = hygiene_strictly_clean
+            && !crate::zygote::daemon_disabled()
             && !src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
                 let t = l.split("--").next().unwrap_or(l).trim();
@@ -5507,7 +5531,7 @@ fn check_single_file(
             }
         }
         let dur_ms = t0.elapsed().as_millis() as i64;
-        if !uncached_shards.is_empty() {
+        if hygiene_strictly_clean && !uncached_shards.is_empty() {
             let now = db::now_unix();
             for (shard_key, shard) in uncached_shards {
                 if let SingleflightOutcome::Leader(lease) =
