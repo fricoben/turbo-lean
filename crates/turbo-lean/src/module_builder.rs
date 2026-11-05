@@ -14199,13 +14199,11 @@ struct ShmReplayedOleanDigestEntry {
     imports: Option<(Vec<ParsedImport>, bool)>,
 }
 
-fn shm_replayed_olean_cache_path(olean_path: &Path) -> PathBuf {
+fn shm_replayed_olean_cache_file_name(olean_path: &Path) -> String {
     let key = blake3::hash(olean_path.to_string_lossy().as_bytes())
         .to_hex()
         .to_string();
-    crate::shm_cache::staging_shm_dir()
-        .join("olean_meta_v1")
-        .join(format!("om_{}.json", &key[..28]))
+    format!("om_{}.json", &key[..28])
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -14216,37 +14214,38 @@ struct ShmSourceHygieneEntry {
 
 pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::HygieneReport> {
     let cur_stat = path_stat_fingerprint(src_path);
-    let cache_path = if cur_stat.is_some() {
+    let cache_file_name = if cur_stat.is_some() {
         let key = blake3::hash(src_path.to_string_lossy().as_bytes())
             .to_hex()
             .to_string();
-        let p = crate::shm_cache::staging_shm_dir()
-            .join("src_hygiene_v1")
-            .join(format!("sh_{}.json", &key[..28]));
-        if let Ok(bytes) = fs::read(&p) {
+        let file_name = format!("sh_{}.json", &key[..28]);
+        if let Some(bytes) =
+            crate::shm_cache::read_verified_private_shm_file("src_hygiene_v1", &file_name)
+        {
             if let Ok(entry) = serde_json::from_slice::<ShmSourceHygieneEntry>(&bytes) {
                 if entry.stat == cur_stat {
                     return Ok(entry.hygiene);
                 }
             }
         }
-        Some(p)
+        Some(file_name)
     } else {
         None
     };
     let src = fs::read_to_string(src_path)?;
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
-    if let (Some(p), Some(post_st)) = (cache_path, path_stat_fingerprint(src_path)) {
+    if let (Some(file_name), Some(post_st)) = (cache_file_name, path_stat_fingerprint(src_path)) {
         if Some(post_st) == cur_stat {
-            if let Some(parent) = p.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
             let entry = ShmSourceHygieneEntry {
                 stat: Some(post_st),
                 hygiene: hygiene.clone(),
             };
             if let Ok(bytes) = serde_json::to_vec(&entry) {
-                let _ = crate::shm_cache::atomic_write_shm(&p, &bytes);
+                let _ = crate::shm_cache::write_verified_private_shm_file(
+                    "src_hygiene_v1",
+                    &file_name,
+                    &bytes,
+                );
             }
         }
     }
@@ -14279,8 +14278,10 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
                 }
             }
         }
-        let shm_path = shm_replayed_olean_cache_path(olean_path);
-        if let Ok(bytes) = fs::read(&shm_path) {
+        let shm_file_name = shm_replayed_olean_cache_file_name(olean_path);
+        if let Some(bytes) =
+            crate::shm_cache::read_verified_private_shm_file("olean_meta_v1", &shm_file_name)
+        {
             if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
                 if entry.stats == cur_stats && !entry.digest.is_empty() {
                     if let Ok(mut g) = memo.lock() {
@@ -14394,17 +14395,18 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
                 }
             }
         }
-        let shm_path = shm_replayed_olean_cache_path(olean_path);
-        if let Some(parent) = shm_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
+        let shm_file_name = shm_replayed_olean_cache_file_name(olean_path);
         let shm_entry = ShmReplayedOleanDigestEntry {
             stats: post_stats,
             digest: res.clone(),
             imports: parsed_imps,
         };
         if let Ok(bytes) = serde_json::to_vec(&shm_entry) {
-            let _ = crate::shm_cache::atomic_write_shm(&shm_path, &bytes);
+            let _ = crate::shm_cache::write_verified_private_shm_file(
+                "olean_meta_v1",
+                &shm_file_name,
+                &bytes,
+            );
         }
     }
     Ok(res)
@@ -14424,8 +14426,10 @@ pub(crate) fn read_olean_binary_imports_cached(
                 }
             }
         }
-        let shm_path = shm_replayed_olean_cache_path(olean_path);
-        if let Ok(bytes) = fs::read(&shm_path) {
+        let shm_file_name = shm_replayed_olean_cache_file_name(olean_path);
+        if let Some(bytes) =
+            crate::shm_cache::read_verified_private_shm_file("olean_meta_v1", &shm_file_name)
+        {
             if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
                 if entry.stats[0] == Some(st) {
                     if let Some((imps, is_mod)) = entry.imports {

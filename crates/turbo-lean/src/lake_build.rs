@@ -952,13 +952,11 @@ struct ShmSingleOleanDigestEntry {
     deps: Vec<String>,
 }
 
-fn shm_single_olean_cache_path(olean_path: &Path) -> PathBuf {
+fn shm_single_olean_cache_file_name(olean_path: &Path) -> String {
     let key = blake3::hash(olean_path.to_string_lossy().as_bytes())
         .to_hex()
         .to_string();
-    crate::shm_cache::staging_shm_dir()
-        .join("olean_iface_v1")
-        .join(format!("oi_{}.json", &key[..28]))
+    format!("oi_{}.json", &key[..28])
 }
 
 fn compute_olean_bundle_sample_key(
@@ -1012,7 +1010,7 @@ pub(crate) fn clear_olean_interface_memo() {
     }
 }
 
-fn single_olean_companion_paths(olean_path: &Path) -> [PathBuf; 5] {
+pub(crate) fn single_olean_companion_paths(olean_path: &Path) -> [PathBuf; 5] {
     [
         PathBuf::from(format!("{}.server", olean_path.display())),
         PathBuf::from(format!("{}.private", olean_path.display())),
@@ -1022,7 +1020,7 @@ fn single_olean_companion_paths(olean_path: &Path) -> [PathBuf; 5] {
     ]
 }
 
-fn single_olean_stat_bundle(
+pub(crate) fn single_olean_stat_bundle(
     olean_path: &Path,
     comp_paths: &[PathBuf; 5],
 ) -> [crate::module_builder::FileStatFingerprint; 6] {
@@ -1036,7 +1034,7 @@ fn single_olean_stat_bundle(
     ]
 }
 
-fn compute_single_olean_digest_and_imports_with_stats(
+pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
     olean_path: &Path,
     comp_paths: &[PathBuf; 5],
     cur_stats: [crate::module_builder::FileStatFingerprint; 6],
@@ -1053,9 +1051,11 @@ fn compute_single_olean_digest_and_imports_with_stats(
         }
     }
     let use_shm = cur_stats[0].is_some_and(|(_, _, len)| len > 65536);
-    let shm_path_opt = use_shm.then(|| shm_single_olean_cache_path(olean_path));
-    if let Some(ref shm_path) = shm_path_opt {
-        if let Ok(shm_bytes) = fs::read(shm_path) {
+    let shm_file_opt = use_shm.then(|| shm_single_olean_cache_file_name(olean_path));
+    if let Some(ref shm_file_name) = shm_file_opt {
+        if let Some(shm_bytes) =
+            crate::shm_cache::read_verified_private_shm_file("olean_iface_v1", shm_file_name)
+        {
             if let Ok(entry) = serde_json::from_slice::<ShmSingleOleanDigestEntry>(&shm_bytes) {
                 if entry.stats == cur_stats && entry.sample_key == sample_key {
                     if let Ok(mut g) = memo.lock() {
@@ -1126,10 +1126,7 @@ fn compute_single_olean_digest_and_imports_with_stats(
             }
         }
         if post_stats == cur_stats && post_sample == sample_key {
-            if let Some(shm_path) = shm_path_opt {
-                if let Some(parent) = shm_path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
+            if let Some(shm_file_name) = shm_file_opt {
                 let shm_entry = ShmSingleOleanDigestEntry {
                     stats: post_stats,
                     sample_key: post_sample,
@@ -1137,7 +1134,11 @@ fn compute_single_olean_digest_and_imports_with_stats(
                     deps: olean_deps.clone(),
                 };
                 if let Ok(shm_bytes) = serde_json::to_vec(&shm_entry) {
-                    let _ = crate::shm_cache::atomic_write_shm(&shm_path, &shm_bytes);
+                    let _ = crate::shm_cache::write_verified_private_shm_file(
+                        "olean_iface_v1",
+                        &shm_file_name,
+                        &shm_bytes,
+                    );
                 }
             }
         }

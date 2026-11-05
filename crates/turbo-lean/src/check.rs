@@ -996,7 +996,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v12:{}", src_b3),
+            split_key: TurboStore::compute_file_split_key_from_src_hash(&src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -1925,7 +1925,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v12:{}", src_b3),
+                    split_key: TurboStore::compute_file_split_key_from_src_hash(&src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -1965,7 +1965,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v12:{}", src_b3)
+                        TurboStore::compute_file_split_key_from_src_hash(&src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -2963,7 +2963,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v12:{}", sub_b3),
+                            split_key: TurboStore::compute_file_split_key_from_src_hash(&sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -3093,310 +3093,317 @@ fn check_single_decl(
         })
     };
 
-    if let Some(remote_url) = remote_http {
-        if db_warm_on_open
-            && store.has_attested_decl_receipt(
-                &shard_key,
-                "trusted",
-                target_decl,
-                &attested.kernel_type_hash,
-            )
-        {
-            let elapsed_ms = t0.elapsed().as_millis();
-            let out_json = make_cache_hit_json(false, elapsed_ms);
-            if emit_stdout {
-                if json_output {
-                    println!("{}", serde_json::to_string_pretty(&out_json)?);
-                } else {
-                    println!(
-                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                        target_decl, elapsed_ms
-                    );
+    if split.hygiene.is_clean_for_certification() {
+        if let Some(remote_url) = remote_http {
+            if db_warm_on_open
+                && store.has_attested_decl_receipt(
+                    &shard_key,
+                    "trusted",
+                    target_decl,
+                    &attested.kernel_type_hash,
+                )
+            {
+                let elapsed_ms = t0.elapsed().as_millis();
+                let out_json = make_cache_hit_json(false, elapsed_ms);
+                if emit_stdout {
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&out_json)?);
+                    } else {
+                        println!(
+                            "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
+                            target_decl, elapsed_ms
+                        );
+                    }
                 }
+                return Ok(out_json);
             }
-            return Ok(out_json);
-        }
-        if active_src.is_empty() {
-            active_src = fs::read_to_string(&active_file)
-                .with_context(|| format!("Failed to read {}", active_file.display()))?;
-        }
-        let canon_file = if active_file == resolved_file {
-            canon_resolved_initial.to_path_buf()
-        } else {
-            active_file
-                .canonicalize()
-                .unwrap_or_else(|_| active_file.clone())
-        };
-        let rooted_target = shard.rooted_name();
-        let single_set = HashSet::from([rooted_target.clone()]);
-        let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
-        let fast_olean_src = if split.shards.len() <= 1 {
-            None
-        } else {
-            resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_file).and_then(
-                |mod_imp| {
-                    splitter::build_fast_olean_shard_source_with_split(
-                        &active_src,
-                        split,
-                        &mod_imp,
-                        &single_set,
-                    )
-                },
-            )
-        };
-        let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
-        let cached_env = if db_warm_on_open {
-            let env_key = TurboStore::compute_lake_env_key(canon_dir);
-            store.get_lake_env(&env_key).ok().flatten()
-        } else {
-            None
-        };
-        let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
-
-        let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
-            if let Some(ref fsrc) = fast_olean_src {
-                vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
-            } else {
-                vec![(psrc.as_str(), true)]
+            if active_src.is_empty() {
+                active_src = fs::read_to_string(&active_file)
+                    .with_context(|| format!("Failed to read {}", active_file.display()))?;
             }
-        } else if let Some(ref fsrc) = fast_olean_src {
-            vec![(fsrc.as_str(), true)]
-        } else {
-            vec![]
-        };
-
-        let mut resp_json = serde_json::Value::Null;
-        let mut remote_status = String::from("unknown");
-        let mut fast_olean_used = false;
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut prestaged_receipt: Option<Vec<u8>> = None;
-        let mut inflight_tx_open = false;
-
-        let full_shard_src: String;
-        let mut candidates = fast_candidates;
-        if candidates.is_empty() {
-            full_shard_src = if !shard.shard_source.is_empty() {
-                shard.shard_source.clone()
+            let canon_file = if active_file == resolved_file {
+                canon_resolved_initial.to_path_buf()
             } else {
-                splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
-                    .unwrap_or_default()
+                active_file
+                    .canonicalize()
+                    .unwrap_or_else(|_| active_file.clone())
             };
-            candidates.push((full_shard_src.as_str(), false));
-        }
+            let rooted_target = shard.rooted_name();
+            let single_set = HashSet::from([rooted_target.clone()]);
+            let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
+            let fast_olean_src = if split.shards.len() <= 1 {
+                None
+            } else {
+                resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_file).and_then(
+                    |mod_imp| {
+                        splitter::build_fast_olean_shard_source_with_split(
+                            &active_src,
+                            split,
+                            &mod_imp,
+                            &single_set,
+                        )
+                    },
+                )
+            };
+            let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
+            let cached_env = if db_warm_on_open {
+                let env_key = TurboStore::compute_lake_env_key(canon_dir);
+                store.get_lake_env(&env_key).ok().flatten()
+            } else {
+                None
+            };
+            let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
 
-        for (cand_src, is_fast) in &candidates {
-            let is_fast = *is_fast;
-            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
-                decl: target_decl.to_string(),
-                shard_key: shard_key.clone(),
-                shard_source: (*cand_src).to_string(),
-                interface_hash: split.interface_hash.clone(),
-                prefix_env_hash: shard.prefix_env_hash.clone(),
-                stmt_hash: shard.stmt_hash.clone(),
-                proof_hash: shard.proof_hash.clone(),
-                toolchain: toolchain.to_string(),
-                lean_path: local_lean_path.clone(),
-                skip_cas_lock: false,
-                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
-                lean_args: file_lean_args.clone(),
-                targets: vec![rooted_target.clone()],
-                expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
-            })?;
-            match pack::http_request_with_inflight(
-                "POST",
-                &endpoint,
-                "application/json",
-                &req_body,
-                || {
-                    if db_warm_on_open && !inflight_tx_open {
-                        if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
-                            target_decl,
-                            &shard.prefix_env_hash,
-                            &shard.stmt_hash,
-                            &shard.proof_hash,
-                            db::now_unix(),
-                            Some(&attested.kernel_type_hash),
-                        ) {
-                            let items = [(
-                                shard_key.clone(),
-                                target_decl.to_string(),
-                                r_bytes.clone(),
-                                1,
-                            )];
-                            if store
-                                .begin_inflight_publish_theorem_shards(toolchain, "trusted", &items)
-                                .is_ok()
-                            {
-                                inflight_tx_open = true;
+            let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
+                if let Some(ref fsrc) = fast_olean_src {
+                    vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
+                } else {
+                    vec![(psrc.as_str(), true)]
+                }
+            } else if let Some(ref fsrc) = fast_olean_src {
+                vec![(fsrc.as_str(), true)]
+            } else {
+                vec![]
+            };
+
+            let mut resp_json = serde_json::Value::Null;
+            let mut remote_status = String::from("unknown");
+            let mut fast_olean_used = false;
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut prestaged_receipt: Option<Vec<u8>> = None;
+            let mut inflight_tx_open = false;
+
+            let full_shard_src: String;
+            let mut candidates = fast_candidates;
+            if candidates.is_empty() {
+                full_shard_src = if !shard.shard_source.is_empty() {
+                    shard.shard_source.clone()
+                } else {
+                    splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
+                        .unwrap_or_default()
+                };
+                candidates.push((full_shard_src.as_str(), false));
+            }
+
+            for (cand_src, is_fast) in &candidates {
+                let is_fast = *is_fast;
+                let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                    decl: target_decl.to_string(),
+                    shard_key: shard_key.clone(),
+                    shard_source: (*cand_src).to_string(),
+                    interface_hash: split.interface_hash.clone(),
+                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                    stmt_hash: shard.stmt_hash.clone(),
+                    proof_hash: shard.proof_hash.clone(),
+                    toolchain: toolchain.to_string(),
+                    lean_path: local_lean_path.clone(),
+                    skip_cas_lock: false,
+                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                    lean_args: file_lean_args.clone(),
+                    targets: vec![rooted_target.clone()],
+                    expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
+                })?;
+                match pack::http_request_with_inflight(
+                    "POST",
+                    &endpoint,
+                    "application/json",
+                    &req_body,
+                    || {
+                        if db_warm_on_open && !inflight_tx_open {
+                            if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
+                                target_decl,
+                                &shard.prefix_env_hash,
+                                &shard.stmt_hash,
+                                &shard.proof_hash,
+                                db::now_unix(),
+                                Some(&attested.kernel_type_hash),
+                            ) {
+                                let items = [(
+                                    shard_key.clone(),
+                                    target_decl.to_string(),
+                                    r_bytes.clone(),
+                                    1,
+                                )];
+                                if store
+                                    .begin_inflight_publish_theorem_shards(
+                                        toolchain, "trusted", &items,
+                                    )
+                                    .is_ok()
+                                {
+                                    inflight_tx_open = true;
+                                }
+                                prestaged_receipt = Some(r_bytes);
                             }
-                            prestaged_receipt = Some(r_bytes);
+                        }
+                    },
+                ) {
+                    Ok(resp_bytes) => {
+                        if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+                            let st = rj
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
+                                let remote_type_ok = rj
+                                    .get("kernel_type_hash")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|h| h == attested.kernel_type_hash)
+                                    || rj
+                                        .get("decl_types")
+                                        .and_then(|v| {
+                                            serde_json::from_value::<
+                                                std::collections::BTreeMap<String, String>,
+                                            >(v.clone())
+                                            .ok()
+                                        })
+                                        .is_some_and(|m| {
+                                            crate::zygote::verify_attested_decl_types(
+                                                &m,
+                                                &expected_type_pair,
+                                            )
+                                            .is_ok()
+                                        });
+                                if remote_type_ok {
+                                    resp_json = rj;
+                                    remote_status = st;
+                                    fast_olean_used = is_fast;
+                                    last_err = None;
+                                    break;
+                                }
+                                last_err = Some(anyhow::anyhow!(
+                                "Remote shard check for `{target_decl}` on {endpoint} missed or mismatched `kernel_type_hash`"
+                            ));
+                            } else {
+                                last_err = Some(anyhow::anyhow!(
+                                    "Remote shard check failed on {}: {}",
+                                    endpoint,
+                                    rj
+                                ));
+                            }
                         }
                     }
-                },
-            ) {
-                Ok(resp_bytes) => {
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if last_err.is_some() && !candidates.iter().any(|(_, is_fast)| !*is_fast) {
+                let fallback_src = if !shard.shard_source.is_empty() {
+                    shard.shard_source.clone()
+                } else {
+                    splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
+                        .unwrap_or_default()
+                };
+                let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                    decl: target_decl.to_string(),
+                    shard_key: shard_key.clone(),
+                    shard_source: fallback_src,
+                    interface_hash: split.interface_hash.clone(),
+                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                    stmt_hash: shard.stmt_hash.clone(),
+                    proof_hash: shard.proof_hash.clone(),
+                    toolchain: toolchain.to_string(),
+                    lean_path: local_lean_path.clone(),
+                    skip_cas_lock: false,
+                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                    lean_args: file_lean_args.clone(),
+                    targets: vec![rooted_target],
+                    expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
+                })?;
+                if let Ok(resp_bytes) =
+                    pack::http_request("POST", &endpoint, "application/json", &req_body)
+                {
                     if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
                         let st = rj
                             .get("status")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string();
-                        if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
-                            let remote_type_ok = rj
-                                .get("kernel_type_hash")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|h| h == attested.kernel_type_hash)
-                                || rj
-                                    .get("decl_types")
-                                    .and_then(|v| {
-                                        serde_json::from_value::<
-                                            std::collections::BTreeMap<String, String>,
-                                        >(v.clone())
-                                        .ok()
-                                    })
-                                    .is_some_and(|m| {
-                                        crate::zygote::verify_attested_decl_types(
-                                            &m,
-                                            &expected_type_pair,
-                                        )
-                                        .is_ok()
-                                    });
-                            if remote_type_ok {
-                                resp_json = rj;
-                                remote_status = st;
-                                fast_olean_used = is_fast;
-                                last_err = None;
-                                break;
-                            }
-                            last_err = Some(anyhow::anyhow!(
-                                "Remote shard check for `{target_decl}` on {endpoint} missed or mismatched `kernel_type_hash`"
-                            ));
-                        } else {
-                            last_err = Some(anyhow::anyhow!(
-                                "Remote shard check failed on {}: {}",
-                                endpoint,
-                                rj
-                            ));
+                        let remote_type_ok = rj
+                            .get("kernel_type_hash")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|h| h == attested.kernel_type_hash)
+                            || rj
+                                .get("decl_types")
+                                .and_then(|v| {
+                                    serde_json::from_value::<
+                                        std::collections::BTreeMap<String, String>,
+                                    >(v.clone())
+                                    .ok()
+                                })
+                                .is_some_and(|m| {
+                                    crate::zygote::verify_attested_decl_types(
+                                        &m,
+                                        &expected_type_pair,
+                                    )
+                                    .is_ok()
+                                });
+                        if (st == "remote_theorem_verified" || st == "remote_theorem_cache_hit")
+                            && remote_type_ok
+                        {
+                            resp_json = rj;
+                            remote_status = st;
+                            fast_olean_used = false;
+                            last_err = None;
                         }
                     }
                 }
-                Err(e) => {
-                    last_err = Some(e);
-                }
             }
-        }
-        if last_err.is_some() && !candidates.iter().any(|(_, is_fast)| !*is_fast) {
-            let fallback_src = if !shard.shard_source.is_empty() {
-                shard.shard_source.clone()
-            } else {
-                splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
-                    .unwrap_or_default()
-            };
-            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
-                decl: target_decl.to_string(),
-                shard_key: shard_key.clone(),
-                shard_source: fallback_src,
-                interface_hash: split.interface_hash.clone(),
-                prefix_env_hash: shard.prefix_env_hash.clone(),
-                stmt_hash: shard.stmt_hash.clone(),
-                proof_hash: shard.proof_hash.clone(),
-                toolchain: toolchain.to_string(),
-                lean_path: local_lean_path.clone(),
-                skip_cas_lock: false,
-                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
-                lean_args: file_lean_args.clone(),
-                targets: vec![rooted_target],
-                expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
-            })?;
-            if let Ok(resp_bytes) =
-                pack::http_request("POST", &endpoint, "application/json", &req_body)
-            {
-                if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-                    let st = rj
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let remote_type_ok = rj
-                        .get("kernel_type_hash")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|h| h == attested.kernel_type_hash)
-                        || rj
-                            .get("decl_types")
-                            .and_then(|v| {
-                                serde_json::from_value::<
-                                    std::collections::BTreeMap<String, String>,
-                                >(v.clone())
-                                .ok()
-                            })
-                            .is_some_and(|m| {
-                                crate::zygote::verify_attested_decl_types(&m, &expected_type_pair)
-                                    .is_ok()
-                            });
-                    if (st == "remote_theorem_verified" || st == "remote_theorem_cache_hit")
-                        && remote_type_ok
-                    {
-                        resp_json = rj;
-                        remote_status = st;
-                        fast_olean_used = false;
-                        last_err = None;
-                    }
+            if let Some(err) = last_err {
+                if inflight_tx_open {
+                    store.rollback_inflight_publish();
                 }
+                return Err(err);
             }
-        }
-        if let Some(err) = last_err {
+
+            let dur_ms = t0.elapsed().as_millis() as i64;
+            let server_elapsed_ms = resp_json
+                .get("server_elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if inflight_tx_open {
-                store.rollback_inflight_publish();
+                store.commit_inflight_publish()?;
+            } else {
+                let receipt = match prestaged_receipt {
+                    Some(r) => r,
+                    None => make_attested_shard_receipt_bytes(
+                        target_decl,
+                        &shard.prefix_env_hash,
+                        &shard.stmt_hash,
+                        &shard.proof_hash,
+                        db::now_unix(),
+                        Some(&attested.kernel_type_hash),
+                    )?,
+                };
+                store.batch_publish_theorem_shards(
+                    toolchain,
+                    "trusted",
+                    &[(
+                        shard_key.clone(),
+                        target_decl.to_string(),
+                        receipt,
+                        (server_elapsed_ms as i64).max(dur_ms),
+                    )],
+                )?;
             }
-            return Err(err);
-        }
 
-        let dur_ms = t0.elapsed().as_millis() as i64;
-        let server_elapsed_ms = resp_json
-            .get("server_elapsed_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if inflight_tx_open {
-            store.commit_inflight_publish()?;
-        } else {
-            let receipt = match prestaged_receipt {
-                Some(r) => r,
-                None => make_attested_shard_receipt_bytes(
-                    target_decl,
-                    &shard.prefix_env_hash,
-                    &shard.stmt_hash,
-                    &shard.proof_hash,
-                    db::now_unix(),
-                    Some(&attested.kernel_type_hash),
-                )?,
-            };
-            store.batch_publish_theorem_shards(
-                toolchain,
-                "trusted",
-                &[(
-                    shard_key.clone(),
-                    target_decl.to_string(),
-                    receipt,
-                    (server_elapsed_ms as i64).max(dur_ms),
-                )],
+            let (_, out_json) = emit_remote_decl_result(
+                json_output,
+                emit_stdout,
+                &resp_json,
+                &remote_status,
+                target_decl,
+                &shard_key,
+                remote_url,
+                fast_olean_used,
+                &split.interface_hash,
+                &shard.prefix_env_hash,
+                split.shards.len(),
+                dur_ms,
             )?;
+            return Ok(out_json);
         }
-
-        let (_, out_json) = emit_remote_decl_result(
-            json_output,
-            emit_stdout,
-            &resp_json,
-            &remote_status,
-            target_decl,
-            &shard_key,
-            remote_url,
-            fast_olean_used,
-            &split.interface_hash,
-            &shard.prefix_env_hash,
-            split.shards.len(),
-            dur_ms,
-        )?;
-        return Ok(out_json);
     }
 
     let singleflight_outcome =
@@ -4636,7 +4643,11 @@ fn check_single_file(
         );
     }
 
-    if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
+    if hygiene_strictly_clean
+        && misses == 0
+        && !split.shards.is_empty()
+        && split.eligible_for_sharding
+    {
         let elapsed_ms = t0.elapsed().as_millis();
         let out_json = serde_json::json!({
             "status": "all_shards_cached",
@@ -4663,7 +4674,7 @@ fn check_single_file(
 
     let requested_jobs = default_parallel_jobs(jobs);
 
-    if split.eligible_for_sharding && !uncached_shards.is_empty() {
+    if hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty() {
         if let Some(remote_url) = remote_http {
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file)
@@ -7923,6 +7934,171 @@ theorem after_macro : ext_magic = 7 := rfl
                 "unexpected error: {bad_err:#}"
             );
         }));
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_check_single_file_remote_http_never_offloads_deferred_hygiene() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_remote_deferred_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mod")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"rem_def_pol\"\ndefaultTargets = [\"Mod\"]\n[[lean_lib]]\nname = \"Mod\"\nglobs = [\"Mod.+\"]\n",
+        )
+        .unwrap();
+
+        // Bind a mock HTTP server that unconditionally returns `{"ok": true}` and counts hits.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote_url = format!("http://{addr}");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_bg = Arc::clone(&hits);
+        let stop_bg = Arc::clone(&stop);
+        let server_handle = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf);
+                        hits_bg.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"ok":true,"status":"shard_verified","cache_hit":false,"cache_hits":0,"verified_count":1,"stdout":"","stderr":"","verified_decl_types":{}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let prev_ax = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "allowedRemoteAx");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 1. File with theorem + disallowed trailing axiom when custom policy is set:
+            //    must NEVER hit `remote_http`, and must fail closed under local kernel gate!
+            let bad_file = proj.join("Mod/BadTrailingAx.lean");
+            fs::write(
+                &bad_file,
+                "theorem ok_thm : 1 + 1 = 2 := rfl\naxiom forbiddenRemoteAx : False\n",
+            )
+            .unwrap();
+            let mut store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let bad_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                bad_file.clone(),
+                None,
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+            )
+            .expect_err(
+                "check_single_file --remote-http must reject disallowed trailing axiom locally",
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "remote HTTP server must receive 0 requests on deferred-hygiene file"
+            );
+            assert!(
+                format!("{bad_err:#}").contains("forbiddenRemoteAx"),
+                "unexpected error: {bad_err:#}"
+            );
+
+            // Also verify `check_single_decl` (`--decl ok_thm --remote-http`) refuses to offload
+            // when the surrounding file has deferred hygiene!
+            let decl_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                bad_file,
+                Some("ok_thm".to_string()),
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "check_single_decl --remote-http must also receive 0 remote HTTP requests on deferred-hygiene file"
+            );
+            let _ = decl_err;
+
+            // 2. File with custom-allowed axiom must also receive 0 remote HTTP requests and
+            //    succeed locally through the whole-file kernel gate.
+            let ok_file = proj.join("Mod/AllowedAx.lean");
+            fs::write(
+                &ok_file,
+                "axiom allowedRemoteAx : True\ntheorem ok_allowed : True := allowedRemoteAx\n",
+            )
+            .unwrap();
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let ok_val = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                ok_file,
+                None,
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+            )
+            .expect("check_single_file --remote-http should pass locally for allowedRemoteAx");
+            assert_eq!(ok_val["status"], "file_verified");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "remote HTTP server must receive 0 requests even when custom axiom is allowed"
+            );
+        }));
+
+        stop.store(true, Ordering::Release);
+        let _ = server_handle.join();
         match prev_ax {
             Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
             None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),

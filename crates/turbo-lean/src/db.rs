@@ -1334,17 +1334,29 @@ impl TurboStore {
     /// falling back to `self.root.join("staging")` so temporary `.lean` shard files never touch disk.
     pub fn fast_staging_dir(&self) -> PathBuf {
         if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
-            let dir = crate::shm_cache::staging_shm_dir();
-            if fs::create_dir_all(&dir).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-                }
+            if let Some(dir) = crate::shm_cache::ensure_verified_private_staging_dir(None) {
                 return dir;
             }
         }
-        self.root.join("staging")
+        let fallback = self.root.join("staging");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            if fs::symlink_metadata(&fallback).is_err() {
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                let _ = builder.create(&fallback);
+            }
+            if fs::symlink_metadata(&fallback)
+                .ok()
+                .is_some_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+            {
+                let _ = fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = fs::create_dir_all(&fallback);
+        fallback
     }
 
     /// Batch-lookup multiple theorem shard keys in a single SQLite pass, verifying that the

@@ -7824,13 +7824,20 @@ pub fn run_pr_verify_command(
     let mut batch_to_publish = Vec::new();
     let mut inflight_tx_open = false;
 
+    let file_hygiene_strictly_clean = |rel_path: &str| -> bool {
+        current_splits
+            .get(rel_path)
+            .is_some_and(|sp| sp.hygiene.is_clean_for_certification())
+    };
     let mut uncached_by_file = Vec::new();
     let mut raw_uncached_jobs = 0usize;
     for (rel_path, file_shards) in attested_shards_by_file {
+        let strictly_clean = file_hygiene_strictly_clean(&rel_path);
         let mut uncached = Vec::new();
-        let mut can_fast_olean = !is_untrusted;
+        let mut can_fast_olean = !is_untrusted && strictly_clean;
         for (k, sh, fast_ok, kth) in file_shards {
-            if cached_set.contains(&k)
+            if strictly_clean
+                && cached_set.contains(&k)
                 && store.has_attested_decl_receipt(&k, &trust_domain, sh.decl_name(), &kth)
             {
                 shard_cache_hits += 1;
@@ -8132,27 +8139,33 @@ pub fn run_pr_verify_command(
                         .map(|(_, sh, kth)| (sh.decl_name().to_string(), kth.clone()))
                 })
                 .collect();
-            if let Some(ref remote_url) = remote_http {
-                let req_items: Vec<pack::CheckShardBatchItem> = uncached_by_file
+            if classification.axiom_flags.is_empty()
+                && uncached_by_file
                     .iter()
-                    .flat_map(|(_, fu, _)| fu.iter().map(to_batch_req_item))
-                    .collect();
-                if let Ok(resp) = pack::offload_check_shards_batch_http(
-                    store,
-                    remote_url,
-                    &req_items,
-                    &cross_src,
-                    &trust_domain,
-                    &toolchain,
-                    &lean_path_str,
-                    &cross_args,
-                ) {
-                    if resp.ok {
-                        cross_batch_done = true;
-                        cross_file_coalesced = true;
-                        fast_olean_used = true;
-                        shard_cache_hits += resp.cache_hits;
-                        shards_verified += resp.verified_count;
+                    .all(|(rp, _, _)| file_hygiene_strictly_clean(rp))
+            {
+                if let Some(ref remote_url) = remote_http {
+                    let req_items: Vec<pack::CheckShardBatchItem> = uncached_by_file
+                        .iter()
+                        .flat_map(|(_, fu, _)| fu.iter().map(to_batch_req_item))
+                        .collect();
+                    if let Ok(resp) = pack::offload_check_shards_batch_http(
+                        store,
+                        remote_url,
+                        &req_items,
+                        &cross_src,
+                        &trust_domain,
+                        &toolchain,
+                        &lean_path_str,
+                        &cross_args,
+                    ) {
+                        if resp.ok {
+                            cross_batch_done = true;
+                            cross_file_coalesced = true;
+                            fast_olean_used = true;
+                            shard_cache_hits += resp.cache_hits;
+                            shards_verified += resp.verified_count;
+                        }
                     }
                 }
             }
@@ -8274,8 +8287,15 @@ pub fn run_pr_verify_command(
         }
 
         if !cross_batch_done {
+            let mut remaining_local = Vec::new();
             if let Some(ref remote_url) = remote_http {
                 for (rel_path, file_uncached, can_fast_olean) in uncached_by_file {
+                    if !classification.axiom_flags.is_empty()
+                        || !file_hygiene_strictly_clean(&rel_path)
+                    {
+                        remaining_local.push((rel_path, file_uncached, false));
+                        continue;
+                    }
                     let src = current_files.get(&rel_path).cloned().unwrap_or_default();
                     let abs_file = canon_dir.join(&rel_path);
                     let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
@@ -8356,6 +8376,11 @@ pub fn run_pr_verify_command(
                     }
                 }
             } else {
+                remaining_local = uncached_by_file;
+            }
+
+            if !remaining_local.is_empty() {
+                let uncached_by_file = remaining_local;
                 let local_zygote_url = if is_untrusted {
                     None
                 } else {
@@ -8580,18 +8605,38 @@ pub fn run_pr_verify_command(
                         .success())
                     };
 
-                    if !verified_ok && is_untrusted {
-                        let out = run_lean_temp_file(
-                            worker_store,
-                            &lean_bin,
-                            &src,
-                            &canon_dir,
-                            &env_vars,
-                            &verification_trust,
-                            &uncached_names,
-                            &file_expected_types,
-                            &file_lean_args,
-                        )?;
+                    let strictly_clean_file = file_hygiene_strictly_clean(rel_path);
+                    if !verified_ok && (is_untrusted || !strictly_clean_file) {
+                        let out = if is_untrusted {
+                            run_lean_temp_file(
+                                worker_store,
+                                &lean_bin,
+                                &src,
+                                &canon_dir,
+                                &env_vars,
+                                &verification_trust,
+                                &uncached_names,
+                                &file_expected_types,
+                                &file_lean_args,
+                            )?
+                        } else {
+                            let (out, _) =
+                                crate::zygote::run_audited_lean_shard_at_with_types_report(
+                                    &worker_store.root,
+                                    &worker_store.fast_staging_dir(),
+                                    Path::new(&lean_bin),
+                                    &env_vars,
+                                    Some(&canon_dir),
+                                    None,
+                                    &src,
+                                    &uncached_names,
+                                    false,
+                                    &file_expected_types,
+                                    &file_lean_args,
+                                    None,
+                                )?;
+                            out
+                        };
                         if !out.status.success() {
                             anyhow::bail!(
                                 "PR file verification failed in {}:\n{}\n{}",
@@ -8632,11 +8677,15 @@ pub fn run_pr_verify_command(
                         let dur_ms = (f_t0.elapsed().as_millis() as i64
                             / (file_uncached.len() as i64).max(1))
                         .max(1);
-                        local_verified = finalize_batch_publish_entries(
-                            &mut local_publish,
-                            file_uncached,
-                            dur_ms,
-                        )?;
+                        if strictly_clean_file {
+                            local_verified = finalize_batch_publish_entries(
+                                &mut local_publish,
+                                file_uncached,
+                                dur_ms,
+                            )?;
+                        } else {
+                            local_verified = file_uncached.len();
+                        }
                     } else {
                         let now = crate::db::now_unix();
                         for (k, sh, kth) in file_uncached.iter() {
@@ -15366,5 +15415,198 @@ end ParityNs
             None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
         }
         run_res
+    }
+
+    #[test]
+    fn test_pr_verify_deferred_hygiene_blocks_fast_olean_remote_http_and_audits_trailing_axioms(
+    ) -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "pr_verify_deferred_trailing_ax",
+            &[
+                ("P/Dep.lean", "def baseVal : Nat := 7\n"),
+                (
+                    "P/Target.lean",
+                    "import P.Dep\ntheorem edited_thm : baseVal = 7 := by\n  exact Eq.refl baseVal\naxiom trailingForbidden : False\n",
+                ),
+                (
+                    "P/Allowed.lean",
+                    "import P.Dep\naxiom allowedPrAx : True\ntheorem ok_thm : baseVal = 7 := by\n  exact Eq.refl baseVal\n",
+                ),
+            ],
+        )?;
+        fs::write(
+            tree.project.join("turbo-lean.toml"),
+            "[axioms]\nallow = [\"allowedPrAx\"]\n",
+        )?;
+        let _ = fs::remove_dir_all(tree.project.join(".lake/build"));
+        git_init_and_commit(&tree.project, "base_with_axioms")?;
+        tree.lake(&["build", "P"])?;
+        let _ = fs::remove_dir_all(tree.project.join(".lake/build/ir"));
+
+        // Proof-only edit on `edited_thm` in `P/Target.lean` (trailing disallowed axiom remains)
+        // and proof-only edit on `ok_thm` in `P/Allowed.lean` (only `allowedPrAx` present).
+        fs::write(
+            tree.project.join("P/Target.lean"),
+            "import P.Dep\ntheorem edited_thm : baseVal = 7 := by\n  exact rfl\naxiom trailingForbidden : False\n",
+        )?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let remote_url = format!("http://{addr}");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_bg = Arc::clone(&hits);
+        let stop_bg = Arc::clone(&stop);
+        let server_handle = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf);
+                        hits_bg.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"ok":true,"status":"shard_verified","cache_hit":false,"cache_hits":0,"verified_count":1,"stdout":"","stderr":"","verified_decl_types":{}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let prev_ax = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "allowedPrAx");
+        let run_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            // 1. `P/Target.lean` has a proof-only edit AND a trailing disallowed axiom:
+            //    must NEVER hit `remote_http`, must NOT skip via `fast_olean`, and must fail closed!
+            let err = run_pr_verify_command(
+                &mut store,
+                true,
+                tree.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                Some(remote_url.clone()),
+                None,
+                false,
+                0,
+                None,
+            )
+            .expect_err("pr-verify must reject trailing disallowed axiom even on proof-only edit with remote_http");
+            let msg = format!("{err:#}");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "pr-verify must never offload deferred-hygiene file to remote_http"
+            );
+            assert!(
+                msg.contains("trailingForbidden"),
+                "expected kernel gate error naming trailingForbidden, got: {msg}"
+            );
+
+            // 2. Revert `P/Target.lean` and remove `trailingForbidden` in a fresh commit, then
+            //    proof-edit `P/Allowed.lean`: must pass locally via zero-stub whole-file audit
+            //    with zero `remote_http` hits!
+            fs::write(
+                tree.project.join("P/Target.lean"),
+                "import P.Dep\ntheorem edited_thm : baseVal = 7 := by\n  exact Eq.refl baseVal\n",
+            )?;
+            git_init_and_commit(&tree.project, "clean_target")?;
+            tree.lake(&["build", "P"])?;
+            let _ = fs::remove_dir_all(tree.project.join(".lake/build/ir"));
+            fs::write(
+                tree.project.join("P/Allowed.lean"),
+                "import P.Dep\naxiom allowedPrAx : True\ntheorem ok_thm : baseVal = 7 := by\n  exact rfl\n",
+            )?;
+            let receipt_path = tree.root.join("allowed_receipt.json");
+            run_pr_verify_command(
+                &mut store,
+                true,
+                tree.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                Some(receipt_path.clone()),
+                None,
+                Some(remote_url.clone()),
+                None,
+                false,
+                0,
+                None,
+            )?;
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "pr-verify must never offload allowedPrAx deferred-hygiene file to remote_http"
+            );
+            assert!(
+                receipt_path.is_file(),
+                "expected verification receipt at {}",
+                receipt_path.display()
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+            assert!(
+                receipt["receipt_blake3"]
+                    .as_str()
+                    .is_some_and(|h| !h.is_empty()),
+                "expected non-empty receipt_blake3 in receipt: {receipt}"
+            );
+            // Also verify shard receipt was NOT published into TurboStore for deferred-hygiene file,
+            // so a second run still does NOT hit `remote_http` and re-verifies locally.
+            run_pr_verify_command(
+                &mut store,
+                true,
+                tree.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                Some(remote_url.clone()),
+                None,
+                false,
+                0,
+                None,
+            )?;
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "warm pr-verify must still never offload allowedPrAx deferred-hygiene file to remote_http"
+            );
+            Ok(())
+        }));
+        stop.store(true, Ordering::Release);
+        let _ = server_handle.join();
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        match run_res {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 }

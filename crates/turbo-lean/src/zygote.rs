@@ -3675,6 +3675,13 @@ pub(crate) fn audit_compiled_modules_with_zygote(
                                 chunk,
                                 lean_path_env,
                             )?;
+                            record_audited_modules_in_store_with_extra_root(
+                                &worker_store,
+                                cfg,
+                                chunk,
+                                lean_path_env,
+                                None,
+                            )?;
                         }
                     }
                     Ok(())
@@ -13371,5 +13378,112 @@ theorem uncached_tail : 2 + 2 = 4 := rfl
         assert_ne!(fs::read(&repaired_2).unwrap(), b"corrupted");
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_compiled_modules_parallel_multichunk_persists_kernel_audited_authority() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_audit_multichunk_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mc")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let mut mod_names = Vec::new();
+        let mut roots_toml = Vec::new();
+        for idx in 0..34 {
+            let m = format!("Mc.M{idx:02}");
+            roots_toml.push(format!("\"{m}\""));
+            fs::write(
+                proj.join(format!("Mc/M{idx:02}.lean")),
+                format!("theorem t_{idx:02} : ({idx} : Nat) = {idx} := rfl\n"),
+            )
+            .unwrap();
+            mod_names.push(m);
+        }
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"mc_pkg\"\ndefaultTargets = [\"Mc\"]\n[[lean_lib]]\nname = \"Mc\"\nroots = [{}]\n",
+                roots_toml.join(", ")
+            ),
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = proj.join(".lake/build/lib/lean/Mc");
+        fs::create_dir_all(&olean_dir).unwrap();
+        for idx in 0..34 {
+            let src = format!("Mc/M{idx:02}.lean");
+            let olean = format!("M{idx:02}.olean");
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&proj)
+                .arg("-R")
+                .arg(&proj)
+                .arg("-o")
+                .arg(olean_dir.join(&olean))
+                .arg(proj.join(&src))
+                .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "lean compile {src} failed: {:?}", out);
+        }
+        let store_dir = tmp_dir.join("external_store");
+        let store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+
+        let prev_batch = std::env::var_os("TURBO_LEAN_AUDIT_BATCH_SIZE");
+        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
+        std::env::set_var("TURBO_LEAN_AUDIT_BATCH_SIZE", "1");
+        std::env::set_var("TURBO_LEAN_JOBS", "2");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &mod_names,
+                &lean_path_env,
+                &[],
+                false,
+            )
+            .expect("parallel multi-chunk audit_compiled_modules_with_zygote must succeed");
+
+            let mut lookup =
+                crate::module_builder::ReplayLookupBatchCache::new(&store, &cfg, &lean_path_env);
+            for m in &mod_names {
+                let olean_path = lookup
+                    .resolve_module_olean(m)
+                    .unwrap_or_else(|| panic!("expected resolved .olean for {m}"));
+                assert!(
+                    lookup.is_audited_in_store(&store, &cfg, &lean_path_env, m, &olean_path),
+                    "parallel multi-chunk audit must persist kernel_audited_oleans_auth for {m}"
+                );
+            }
+        }));
+        match prev_batch {
+            Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_BATCH_SIZE", v),
+            None => std::env::remove_var("TURBO_LEAN_AUDIT_BATCH_SIZE"),
+        }
+        match prev_jobs {
+            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
+            None => std::env::remove_var("TURBO_LEAN_JOBS"),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
     }
 }
