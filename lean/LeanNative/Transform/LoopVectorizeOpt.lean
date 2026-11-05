@@ -11,6 +11,8 @@ import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Frontend.ProofRetention
 import LeanNative.Proofs.ProofRetentionProofs
+import LeanNative.Transform.CostAutotune
+import LeanNative.Proofs.CostAutotuneSoundness
 
 namespace LeanNative.Transform
 
@@ -287,8 +289,22 @@ def proofRetentionContract : VerifiedCodePassContract :=
 def proofRetentionPass : TransformPass :=
   TransformPass.ofVerifiedContract proofRetentionContract
 
+def costAutotuneContract : VerifiedCodePassContract :=
+  verifiedCostAutotuneContract (HardwareCostProfile.forTarget .x86_64) [] []
+    (LeanNative.Proofs.autotuneCodeWithAmdahl_sound
+      (HardwareCostProfile.forTarget .x86_64) [] [])
+
+def costAutotunePassFor (base : HardwareCostProfile) (samples : List OpTimingSample)
+    (corpus : List CorpusTimingSample) : TransformPass :=
+  TransformPass.ofVerifiedContract
+    (verifiedCostAutotuneContract base samples corpus
+      (LeanNative.Proofs.autotuneCodeWithAmdahl_sound base samples corpus))
+
+def costAutotunePass : TransformPass :=
+  TransformPass.ofVerifiedContract costAutotuneContract
+
 def verifiedKernelPasses : List TransformPass :=
-  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass]
+  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass, costAutotunePass]
 
 /-- Extended TV-validated pass pipeline (`UnboxTupleSROA`, `HoistExclusivity`, `LoopVectorizeOpt`,
     and extended `AlgebraicOpt` rules gated by `SymbolicTV.validateTranslationDecl`). -/

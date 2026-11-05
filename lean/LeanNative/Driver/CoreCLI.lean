@@ -28,6 +28,7 @@ import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.Driver.Worker
 import LeanNative.Driver.CAbiEmit
 import LeanNative.Driver.EvalBatch
+import LeanNative.Driver.CostAutotuneCLI
 import LeanSys.Posix
 import LeanSys.Codec
 
@@ -838,6 +839,7 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
     "  compile-fastcheck  Run Constraint-Propagating FastCheck or emit SIMD/PTX/Metal kernels (--samples N, --json, -o <path>)",
     "  compile-hybrid     Partition module into CPU/GPU and emit hybrid host dispatch glue (--input <file>, -o <path>)",
     "  superopt           Run cost-guided enumerative superoptimizer (--target x86_64|arm64|cuda_ptx|apple_metal, --json)",
+    "  calibrate-cost     Calibrate hardware cost profile (--target <preset>, --samples-json <path>, --json)",
     "  plugins            Run segregated optimization plugins under Law 1 TV/Cost Gate (--target <arch>, --test-adversarial, --json)",
     "  pr-verify          Run Law 5 PR & Spec-Pinning Gate (--base <ref>, --disallow-spec-changes, --json)",
     "  turbo-plugin       Run JSONL-stdio external accelerator plugin for turbo-lean",
@@ -956,6 +958,7 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
     throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
   match args with
   | "audit-axioms" :: rest       => some <$> runAuditAxioms rest
+  | "calibrate-cost" :: rest     => some <$> LeanNative.Driver.CostAutotuneCLI.run rest
   | "bench-snark-kernels" :: rest => some <$> runBenchSnarkKernels rest
   | "eval-lnir" :: rest          => some <$> runEvalLNIR elaborateHook? rest
   | "compile-llvm" :: rest       => some <$> runCompileLLVM tag elaborateHook? rest

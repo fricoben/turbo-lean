@@ -45,6 +45,7 @@ import LeanNative.Backend.StableHLOAst
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Proofs.ProofRetentionProofs
+import LeanNative.Proofs.CostAutotuneSoundness
 
 namespace LeanNative.Proofs
 
@@ -469,6 +470,15 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ptxBoundsFreeLoad_sound
   , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
   , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous
+  , ``LeanNative.Proofs.calibrateHardwareProfile_preserves_target
+  , ``LeanNative.Proofs.meetsOnePercentE2EGain_iff
+  , ``LeanNative.Proofs.meetsOnePercentE2EGain_rejects_subthreshold
+  , ``LeanNative.Proofs.superoptModuleWithCalibratedProfile_sound
+  , ``LeanNative.Proofs.autotuneCodeWithAmdahl_sound
+  , ``LeanNative.Proofs.autotuneCodeWithAmdahl_uncalibrated_preserves
+  , ``LeanNative.Proofs.autotuneDeclWithAmdahl_sound
+  , ``LeanNative.Proofs.autotuneSuperoptModule_sound
+  , ``LeanNative.Proofs.costAutotune_amdahl_gate_nonvacuous
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

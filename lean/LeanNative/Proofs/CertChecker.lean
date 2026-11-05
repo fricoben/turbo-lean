@@ -102,7 +102,12 @@ def verifiedTheoremRegistry : List String :=
     "checkNonEscapingAsync_rejects_closure", "asyncStateMachine_zeroAlloc_nonvacuous",
     "elideMarkMtAndZeroRc_sound", "optimizeThreadLocalOwnershipRC_sound",
     "elideBorrowedAndThreadLocalRC_sound",
-    "dischargeLocalExclusivity_refines"
+    "dischargeLocalExclusivity_refines",
+    "calibrateHardwareProfile_preserves_target", "meetsOnePercentE2EGain_iff",
+    "meetsOnePercentE2EGain_rejects_subthreshold", "superoptModuleWithCalibratedProfile_sound",
+    "autotuneCodeWithAmdahl_sound", "autotuneCodeWithAmdahl_uncalibrated_preserves",
+    "autotuneDeclWithAmdahl_sound",
+    "autotuneSuperoptModule_sound", "costAutotune_amdahl_gate_nonvacuous"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",
@@ -160,6 +165,7 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.CostAutotuneSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++
