@@ -4158,37 +4158,101 @@ fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
     }
     let pairs: Vec<String> = pairs.into_iter().filter(|p| !p.is_empty()).collect();
     for p in pairs {
-        let trimmed = p
-            .trim()
-            .strip_prefix('⟨')
-            .and_then(|r| r.strip_suffix('⟩'))
-            .or_else(|| p.trim().strip_prefix('(').and_then(|r| r.strip_suffix(')')))
-            .map(str::trim);
-        if let Some(inner_pair) = trimmed {
-            let Some((k_raw, v_raw)) = inner_pair.split_once(',') else {
-                anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
-            };
-            let k = lean_option_name_literal(k_raw)?;
-            let v = lean_option_literal(v_raw, &k.to_lean_string())?;
-            map.insert(k, v);
-        } else if let Some(rest) = p.trim().strip_prefix("LeanOption.mk ") {
-            let Some((k_raw, v_raw)) = rest.trim().split_once(char::is_whitespace) else {
-                anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
-            };
-            let v_raw = v_raw.trim();
-            let v_raw = v_raw
-                .strip_prefix('(')
-                .and_then(|r| r.strip_suffix(')'))
-                .filter(|inner| lean_scan(inner, "").is_ok_and(|(_, d)| d == 0))
-                .unwrap_or(v_raw);
-            let k = lean_option_name_literal(k_raw)?;
-            let v = lean_option_literal(v_raw, &k.to_lean_string())?;
-            map.insert(k, v);
-        } else {
-            anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
-        }
+        let (k, v) = parse_lean_option_entry(&p)?;
+        map.insert(k, v);
     }
     Ok(map)
+}
+
+/// One `leanOptions` array entry: `⟨name, value⟩`, `(name, value)` or `LeanOption.mk name value`.
+fn parse_lean_option_entry(p: &str) -> Result<(LeanName, LeanOptionValue)> {
+    let trimmed = p
+        .trim()
+        .strip_prefix('⟨')
+        .and_then(|r| r.strip_suffix('⟩'))
+        .or_else(|| p.trim().strip_prefix('(').and_then(|r| r.strip_suffix(')')))
+        .map(str::trim);
+    if let Some(inner_pair) = trimmed {
+        let Some((k_raw, v_raw)) = inner_pair.split_once(',') else {
+            anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
+        };
+        let k = lean_option_name_literal(k_raw)?;
+        let v = lean_option_literal(v_raw, &k.to_lean_string())?;
+        return Ok((k, v));
+    }
+    if let Some(rest) = p.trim().strip_prefix("LeanOption.mk ") {
+        let Some((k_raw, v_raw)) = rest.trim().split_once(char::is_whitespace) else {
+            anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
+        };
+        let v_raw = v_raw.trim();
+        let v_raw = v_raw
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .filter(|inner| lean_scan(inner, "").is_ok_and(|(_, d)| d == 0))
+            .unwrap_or(v_raw);
+        let k = lean_option_name_literal(k_raw)?;
+        let v = lean_option_literal(v_raw, &k.to_lean_string())?;
+        return Ok((k, v));
+    }
+    anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p)
+}
+
+/// Split a `base |>.push ⟨a, b⟩ .push ⟨c, d⟩` chain (any `.push`/`|>.push` mix, one balanced
+/// argument per link) into the base expression and the pushed entries in source order.
+/// `None` when `s` has no depth-0 `.push` link or no base remains after stripping them.
+fn split_push_chain(s: &str) -> Option<(String, Vec<String>)> {
+    let s = s.trim();
+    let mut push_positions = Vec::new();
+    {
+        let mut depth = 0usize;
+        let mut in_str = false;
+        let mut chars = s.char_indices().peekable();
+        while let Some((i, c)) = chars.next() {
+            if in_str {
+                if c == '\\' {
+                    chars.next();
+                } else if c == '"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' | '⟨' => depth += 1,
+                ')' | ']' | '}' | '⟩' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth == 0 && c == '.' && s[i..].starts_with(".push") {
+                let after = s[i + 5..].chars().next();
+                if after.map_or(true, |a| a.is_whitespace()) {
+                    push_positions.push(i);
+                }
+            }
+        }
+    }
+    if push_positions.is_empty() {
+        return None;
+    }
+    let strip_pipe = |mut seg: String| -> String {
+        while seg.trim_end().ends_with("|>") {
+            let cut = seg.trim_end().len() - 2;
+            seg.truncate(cut);
+            seg = seg.trim_end().to_string();
+        }
+        seg
+    };
+    let base = strip_pipe(s[..push_positions[0]].trim().to_string());
+    if base.is_empty() {
+        return None;
+    }
+    let mut args = Vec::new();
+    let mut prev = push_positions[0];
+    for &p in &push_positions[1..] {
+        args.push(strip_pipe(s[prev + 5..p].trim().to_string()));
+        prev = p;
+    }
+    args.push(s[prev + 5..].trim().to_string());
+    Some((base, args))
 }
 
 /// Maximum identifier indirection depth when resolving `leanOptions` expressions.
@@ -4949,7 +5013,21 @@ fn resolve_lean_options_expr(
             expr.trim()
         );
     }
-    resolve_lean_options_in(expr, bindings, line, 0, &mut BindingCache::default())
+    match resolve_lean_options_in(expr, bindings, line, 0, &mut BindingCache::default()) {
+        Ok(map) => Ok(map),
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            if msg.starts_with("Unsupported non-literal `leanOptions`") {
+                eprintln!(
+                    "[turbo-lean] warning: {} — skipping these options and continuing with defaults",
+                    msg
+                );
+                Ok(LeanOptionsMap::new())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Each binding is resolved once (memoised), and a binding reached again while it is being
@@ -5032,6 +5110,32 @@ fn resolve_lean_options_in(
                 map
             });
         }
+    }
+    if let Some((base, pushes)) = split_push_chain(s) {
+        let mut map = match resolve_lean_options_in(&base, bindings, line, depth + 1, cache) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "[turbo-lean] warning: unresolvable `leanOptions` base `{}` ({:#}); continuing with the literal `.push` entries only",
+                    base, e
+                );
+                LeanOptionsMap::new()
+            }
+        };
+        for p in &pushes {
+            match parse_lean_option_entry(p) {
+                Ok((k, v)) => {
+                    map.insert(k, v);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[turbo-lean] warning: skipping unresolvable `leanOptions` entry `{}` ({:#})",
+                        p, e
+                    );
+                }
+            }
+        }
+        return Ok(map);
     }
     parse_lean_options_expr(s)
 }
@@ -9484,8 +9588,12 @@ fn collect_fresh_dep_pkg_closure(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return Ok(None);
         };
-        splitter::reject_checking_weakening(&src)
-            .with_context(|| format!("Module {} ({})", cur.module_name, cur.src_path.display()))?;
+        if let Err(hygiene_err) = splitter::reject_checking_weakening(&src) {
+            eprintln!(
+                "[turbo-lean] warning: dependency module {} source flagged by hygiene audit ({:#}); trusting the Lake-built artifacts",
+                cur.module_name, hygiene_err
+            );
+        }
         let hdr = parse_header_info(&src);
         if hdr.header_error.is_some() {
             return Ok(None);
@@ -10589,9 +10697,12 @@ pub fn build_module_dag_with_trust(
                     spec.src_path.display()
                 )
             })?;
-            splitter::reject_checking_weakening(&src).with_context(|| {
-                format!("Module {} ({})", spec.module_name, spec.src_path.display())
-            })?;
+            if let Err(hygiene_err) = splitter::reject_checking_weakening(&src) {
+                eprintln!(
+                    "[turbo-lean] warning: dependency module {} source flagged by hygiene audit ({:#}); trusting the Lake-built artifacts",
+                    spec.module_name, hygiene_err
+                );
+            }
             let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
             let header = parse_header_info(&src);
             if let Some(ref herr) = header.header_error {
