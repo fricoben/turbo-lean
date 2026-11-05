@@ -15,7 +15,9 @@ theorem calibrateHardwareProfile_preserves_target (base : HardwareCostProfile)
     0 < p.addSubCost ∧ 0 < p.bitwiseCost ∧ 0 < p.shiftCost ∧ 0 < p.cmpCost ∧
     0 < p.mulCost ∧ 0 < p.divModCost ∧ 0 < p.fmaCost ∧ 0 < p.selectCost ∧
     0 < p.clz256Cost ∧ 0 < p.addSubChecked256Cost ∧ 0 < p.mulChecked256Cost ∧
-    0 < p.minGpuElements ∧ 0 < p.gpuBlockThreads ∧ 0 < p.matmulTileDim := by
+    0 < p.minGpuElements ∧ 0 < p.gpuBlockThreads ∧ 0 < p.matmulTileDim ∧
+    p.minGpuElements = max 1 base.minGpuElements ∧
+    p.gpuBlockThreads = max 1 base.gpuBlockThreads ∧ p.matmulTileDim = max 1 base.matmulTileDim := by
   have max_one_pos (n : Nat) : 0 < max 1 n := Nat.lt_of_lt_of_le Nat.zero_lt_one (Nat.le_max_left 1 n)
   have cost_pos (op : String) (preset unit : Nat) :
       0 < (match operationMedianNs? samples op with
@@ -26,7 +28,7 @@ theorem calibrateHardwareProfile_preserves_target (base : HardwareCostProfile)
   exact ⟨rfl, rfl, rfl, rfl, cost_pos _ _ _, cost_pos _ _ _, cost_pos _ _ _,
     cost_pos _ _ _, cost_pos _ _ _, cost_pos _ _ _, cost_pos _ _ _, cost_pos _ _ _,
     cost_pos _ _ _, cost_pos _ _ _, cost_pos _ _ _, max_one_pos _, max_one_pos _,
-    max_one_pos _⟩
+    max_one_pos _, rfl, rfl, rfl⟩
 
 theorem meetsOnePercentE2EGain_iff (b c : Nat) :
     meetsOnePercentE2EGain b c = true ↔ 0 < b ∧ c * 100 ≤ b * 99 := by
@@ -95,35 +97,12 @@ theorem superoptCodeSelective_sound (p : HardwareCostProfile) (targetLabel declN
   | seqFor iv lv hv av ai aty step k ihs ihk =>
     intro fuel env st v st' hsrc
     simp only [superoptCodeSelective, evalCode] at hsrc ⊢
-    cases hlo : env lv with
-    | none => simp [hlo] at hsrc
-    | some vlo =>
-      cases hhi : env hv with
-      | none => simp [hlo, hhi] at hsrc
-      | some vhi =>
-        cases hinit : env ai with
-        | none => simp [hlo, hhi, hinit] at hsrc
-        | some vinit =>
-          simp only [hlo, hhi, hinit] at hsrc ⊢
-          cases vlo <;> try simp at hsrc
-          cases vhi <;> try simp at hsrc
-          rename_i lo hi
-          dsimp only [] at hsrc ⊢
-          cases hloop :
-              evalSeqLoop (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
-          | error err => simp [hloop] at hsrc
-          | ok pair =>
-            rw [hloop] at hsrc
-            have hloop' :=
-              evalSeqLoop_refines (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step)
-                (fun stepEnv stepSt =>
-                  evalCode fuel stepEnv stepSt
-                    (superoptCodeSelective p targetLabel declName keepIdx step nextIdx).1)
-                pair (fun sEnv sSt sv sSt' hs => ihs nextIdx fuel sEnv sSt sv sSt' hs) hloop
-            rw [hloop']
-            exact ihk _ fuel (env.bind av pair.1) pair.2 v st' hsrc
+    split at hsrc <;> try contradiction
+    next lo hi init hlo hhi hinit =>
+      split at hsrc <;> try contradiction
+      next finalAcc finalSt hloop =>
+        rw [evalSeqLoop_refines _ _ _ _ _ _ _ _ _ (finalAcc, finalSt) (ihs nextIdx fuel) hloop]
+        exact ihk _ fuel _ _ v st' hsrc
   | parFor ov lv ins ety kern k ih =>
     cases kern with
     | customScalar idxVar inVars body =>
@@ -281,7 +260,7 @@ theorem autotuneSuperoptModule_sound (base : HardwareCostProfile)
   dsimp only []
   split
   · exact superoptModuleSelective_sound (calibrateHardwareProfile base samples)
-      (keepDeclSiteByAblations ablations) m d hd
+      (fun decl => keepDeclSiteByAblations ablations decl corpus.length) m d hd
   · exact ⟨d, hd, CodeRefines.refl _⟩
 
 theorem costAutotune_amdahl_gate_nonvacuous :
@@ -295,13 +274,13 @@ theorem costAutotune_amdahl_gate_nonvacuous :
     let m : LNIRModule := { moduleName := "amdahl", decls := [d] }
     let good := autotuneSuperoptModule base []
       [CorpusTimingSample.mk 1000 990 1 ""] m
-      [{ siteIdx := 0, declName := "fma", baselineNs := 1000, soloCandidateNs := 980 }]
+      [{ siteIdx := 0, declName := "fma", baselineNs := 1000, soloCandidateNs := 980, workloadPairs := [(1000, 980)] }]
     let bad := autotuneSuperoptModule base []
       [CorpusTimingSample.mk 1000 991 1 ""] m
-      [{ siteIdx := 0, declName := "fma", baselineNs := 1000, soloCandidateNs := 980 }]
+      [{ siteIdx := 0, declName := "fma", baselineNs := 1000, soloCandidateNs := 980, workloadPairs := [(1000, 980)] }]
     let ablatedReject := autotuneSuperoptModule base []
       [CorpusTimingSample.mk 1000 990 1 ""] m
-      [CandidateAblationSample.mk 0 "fma" 1000 995 1 []]
+      [CandidateAblationSample.mk 0 "fma" 1000 995 1 [(1000, 995)]]
     scalarExprCostWithProfile p fused < scalarExprCostWithProfile p e ∧
     good.2.accepted = true ∧
     bad.2.accepted = false ∧
@@ -394,18 +373,20 @@ theorem costAutotune_amdahl_gate_nonvacuous :
   rcases hso "" with ⟨r0, hr0⟩
   have hcodeKeep :
       superoptCodeSelective (HardwareCostProfile.forTarget .x86_64) lbl "fma"
-        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 980 1 []])
+        (fun idx => keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 980 1 [(1000, 980)]] idx)
         (.letBind 3 .i64 (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3)) 0 =
       (.letBind 3 .i64 (.scalar (.fma (.var 0) (.var 1) (.var 2))) (.ret 3), [r], 1) := by
     rw [superoptCodeSelective, hr]
-    simp [superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives, meetsOnePercentE2EGain]
+    simp [superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives,
+      meetsCorpusGeomeanOnePercentGain, corpusProdBaseline, corpusProdCandidate]
   have hcodePrune :
       superoptCodeSelective (HardwareCostProfile.forTarget .x86_64) lbl "fma"
-        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1 []])
+        (fun idx => keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1 [(1000, 995)]] idx)
         (.letBind 3 .i64 (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3)) 0 =
       (.letBind 3 .i64 (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3), [], 1) := by
     rw [superoptCodeSelective, hr]
-    simp [superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives, meetsOnePercentE2EGain]
+    simp [superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives,
+      meetsCorpusGeomeanOnePercentGain, corpusProdBaseline, corpusProdCandidate]
   have hcost :
       scalarExprCostWithProfile (HardwareCostProfile.forTarget .x86_64)
         (.fma (.var 0) (.var 1) (.var 2)) <
@@ -413,7 +394,7 @@ theorem costAutotune_amdahl_gate_nonvacuous :
         (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2)) := by decide
   have hdeclKeep :
       superoptDeclSelective (HardwareCostProfile.forTarget .x86_64) lbl
-        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 980 1 []])
+        (fun idx => keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 980 1 [(1000, 980)]] idx)
         { name := "fma", params := [], retTy := .i64,
           body := .letBind 3 .i64
             (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3) } 0 =
@@ -426,7 +407,7 @@ theorem costAutotune_amdahl_gate_nonvacuous :
     rfl
   have hdeclPrune :
       superoptDeclSelective (HardwareCostProfile.forTarget .x86_64) lbl
-        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1 []])
+        (fun idx => keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1 [(1000, 995)]] idx)
         { name := "fma", params := [], retTy := .i64,
           body := .letBind 3 .i64
             (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3) } 0 =
@@ -442,13 +423,14 @@ theorem costAutotune_amdahl_gate_nonvacuous :
   simp only [autotuneSuperoptModule, hp]
   simp only [pruneCandidatesByAblation, superoptModuleSelective,
     List.foldl, List.nil_append, hlbl]
-  simp only [keepDeclSiteByAblations, List.filter_cons, List.filter_nil, beq_self_eq_true,
-    ite_true]
+  unfold keepDeclSiteByAblations
+  dsimp only [List.length]
+  simp only [List.filter_cons, List.filter_nil, beq_self_eq_true, ite_true]
   rw [hdeclKeep, hdeclPrune]
   simp [corpusCalibrationReceipt, meetsCorpusGeomeanOnePercentGain,
     corpusProdBaseline, corpusProdCandidate, aggregateCorpusTimings, hcost,
     superoptDeclSelective, superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives,
-    meetsOnePercentE2EGain, hlbl, hr, hr0]
+    hlbl, hr, hr0]
 
 
 end LeanNative.Proofs

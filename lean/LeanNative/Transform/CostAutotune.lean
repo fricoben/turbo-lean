@@ -20,9 +20,6 @@ def canonicalTimingOperation : String → String
   | "addChecked256" | "subChecked256" | "addSubChecked256" | "add_sub_checked256" =>
     "add_sub_checked256"
   | "mulChecked256" | "mul_checked256" => "mul_checked256"
-  | "minGpuElements" => "min_gpu_elements"
-  | "gpuBlockThreads" => "gpu_block_threads"
-  | "matmulTileDim" => "matmul_tile_dim"
   | operation => operation
 
 def operationMedianNs? (samples : List OpTimingSample) (operation : String) : Option Nat :=
@@ -45,7 +42,6 @@ def calibrateHardwareProfile (base : HardwareCostProfile) (samples : List OpTimi
     match operationMedianNs? samples operation with
     | some ns => max 1 (ns / unit)
     | none => max 1 preset
-  let tuning := fun operation preset => max 1 ((operationMedianNs? samples operation).getD preset)
   { base with
     addSubCost := cost "add_sub" base.addSubCost
     bitwiseCost := cost "bitwise" base.bitwiseCost
@@ -58,9 +54,9 @@ def calibrateHardwareProfile (base : HardwareCostProfile) (samples : List OpTimi
     clz256Cost := cost "clz256" base.clz256Cost
     addSubChecked256Cost := cost "add_sub_checked256" base.addSubChecked256Cost
     mulChecked256Cost := cost "mul_checked256" base.mulChecked256Cost
-    minGpuElements := tuning "min_gpu_elements" base.minGpuElements
-    gpuBlockThreads := tuning "gpu_block_threads" base.gpuBlockThreads
-    matmulTileDim := tuning "matmul_tile_dim" base.matmulTileDim }
+    minGpuElements := max 1 base.minGpuElements
+    gpuBlockThreads := max 1 base.gpuBlockThreads
+    matmulTileDim := max 1 base.matmulTileDim }
 
 def HardwareCostProfile.toJson (p : HardwareCostProfile) : String :=
   let strings := [
@@ -115,13 +111,14 @@ structure CandidateAblationSample where
 
 def candidateAblationSurvives (s : CandidateAblationSample) : Bool :=
   s.hits > 0 && s.baselineNs > 0 && s.soloCandidateNs > 0 &&
-    if s.workloadPairs.isEmpty then meetsOnePercentE2EGain s.baselineNs s.soloCandidateNs
-    else meetsCorpusGeomeanOnePercentGain (s.workloadPairs.map fun (b, c) =>
+    meetsCorpusGeomeanOnePercentGain (s.workloadPairs.map fun (b, c) =>
       { baselineNs := b, candidateNs := c, hits := s.hits })
 
-def keepSiteByAblations (ablations : List CandidateAblationSample) (siteIdx : Nat) : Bool :=
+def keepSiteByAblations (ablations : List CandidateAblationSample) (siteIdx : Nat)
+    (expectedPairs : Nat := 1) : Bool :=
   let matching := ablations.filter (fun s => s.siteIdx == siteIdx)
-  !matching.isEmpty && matching.all candidateAblationSurvives
+  !matching.isEmpty && matching.all (fun s =>
+    s.workloadPairs.length == expectedPairs && candidateAblationSurvives s)
 
 def superoptCodeSelective (p : HardwareCostProfile) (targetLabel declName : String)
     (keepIdx : Nat → Bool) : LNIRCode → Nat → LNIRCode × List SuperoptRewriteRecord × Nat
@@ -207,8 +204,9 @@ def superoptModuleWithProfile (p : HardwareCostProfile) (m : LNIRModule) : LNIRM
     (fun decl idx => p.keptSites?.all (fun sites => sites.contains (decl, idx))) m
   (candidate, report)
 
-def keepDeclSiteByAblations (ablations : List CandidateAblationSample) (decl : String) : Nat → Bool :=
-  keepSiteByAblations (ablations.filter (fun s => s.declName == decl))
+def keepDeclSiteByAblations (ablations : List CandidateAblationSample) (decl : String)
+    (expectedPairs : Nat := 1) : Nat → Bool :=
+  fun idx => keepSiteByAblations (ablations.filter (fun s => s.declName == decl)) idx expectedPairs
 
 structure CalibrationReceipt where
   profile : HardwareCostProfile
@@ -244,7 +242,7 @@ def corpusCalibrationReceipt (p : HardwareCostProfile) (corpus : List CorpusTimi
 def pruneCandidatesByAblation (p : HardwareCostProfile) (corpus : List CorpusTimingSample)
     (m : LNIRModule) (ablations : List CandidateAblationSample := []) :
     LNIRModule × CalibrationReceipt :=
-  let keepIdx := keepDeclSiteByAblations ablations
+  let keepIdx := fun decl => keepDeclSiteByAblations ablations decl corpus.length
   let (candidate, report, totalSites) := superoptModuleSelective p keepIdx m
   let pruned := totalSites - report.rewritesApplied
   let sites := m.decls.flatMap fun d =>
@@ -272,15 +270,18 @@ def autotuneDeclWithAmdahl (base : HardwareCostProfile) (samples : List OpTiming
     (ablations : List CandidateAblationSample := []) : LNIRDecl × CalibrationReceipt :=
   let p := calibrateHardwareProfile base samples
   let declAblations := ablations.filter (fun s => s.declName == d.name)
-  let keepIdx := keepSiteByAblations declAblations
+  let keepIdx := fun idx => keepSiteByAblations declAblations idx corpus.length
   let (candidate, records, totalSites) :=
     superoptDeclSelective p s!"{p.target.toString}:{p.profileId}" keepIdx d 0
   let declHits := (aggregateCorpusTimings (corpus.filter (fun s => s.declName == d.name))).hits
   let pruned := totalSites - records.length
-  let receipt := corpusCalibrationReceipt p corpus (if declHits > 0 then records.length else 0)
+  let sites := (List.range totalSites).filterMap fun idx =>
+    if keepIdx idx then some (d.name, idx) else none
+  let selected := { p with keptSites? := some sites }
+  let receipt := corpusCalibrationReceipt selected corpus (if declHits > 0 then records.length else 0)
     none totalSites pruned
   (if receipt.accepted then candidate else d,
-    { receipt with profile := if receipt.accepted then p else base })
+    { receipt with profile := if receipt.accepted then selected else { base with keptSites? := some [] } })
 
 def calibrationPreset : String → Option HardwareCostProfile
   | "zen5" => some { HardwareCostProfile.forTarget .x86_64 with
@@ -303,7 +304,7 @@ def autotuneCodeWithAmdahl (base : HardwareCostProfile) (samples : List OpTiming
     (corpus : List CorpusTimingSample) (ablations : List CandidateAblationSample := [])
     (c : LNIRCode) (declName : String := "autotune") : LNIRCode :=
   let p := calibrateHardwareProfile base samples
-  let keepIdx := keepDeclSiteByAblations ablations declName
+  let keepIdx := keepDeclSiteByAblations ablations declName corpus.length
   let (candidate, records, totalSites) :=
     superoptCodeSelective p s!"{p.target.toString}:{p.profileId}" declName keepIdx c 0
   let pruned := totalSites - records.length

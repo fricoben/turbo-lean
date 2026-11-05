@@ -15,9 +15,7 @@ private def operations : List String :=
 private def acceptedOperations : List String := operations ++
   ["sub", "mod", "bitAnd", "bitOr", "bitXor", "shl", "shr", "sar", "eq", "lt", "le", "not", "neg",
    "add_sub", "addSub", "div_mod", "divMod", "clz256",
-   "add_sub_checked256", "addSubChecked256", "mul_checked256", "mulChecked256",
-   "min_gpu_elements", "minGpuElements", "gpu_block_threads", "gpuBlockThreads",
-   "matmul_tile_dim", "matmulTileDim"]
+   "add_sub_checked256", "addSubChecked256", "mul_checked256", "mulChecked256"]
 
 def canonicalCorpusDeclNames : List String :=
   mkCanonicalBenchmarkModule8.decls.map (·.name)
@@ -115,13 +113,13 @@ private def parseAblationEntry (j : Json) : Except String CandidateAblationSampl
   let baselineNs ← positiveNat (← j.getObjVal? "baselineNs")
   let soloCandidateNs ← positiveNat (← j.getObjVal? "soloCandidateNs")
   let hits ← nonNegNat (← j.getObjVal? "hits") "hits must be a non-negative integer"
-  let workloadPairs ← if keys.contains "workloadPairs" then do
-    let rows ← (← j.getObjVal? "workloadPairs").getArr?
-    rows.toList.mapM fun row => do
-      let b ← positiveNat (← row.getObjVal? "baselineNs")
-      let c ← positiveNat (← row.getObjVal? "soloCandidateNs")
-      return (b, c)
-    else pure []
+  let rows ← (← j.getObjVal? "workloadPairs").getArr?
+  if rows.size != canonicalCorpusDeclNames.length then
+    throw "ablation workloadPairs must cover all canonical workloads"
+  let workloadPairs ← rows.toList.mapM fun row => do
+    let b ← positiveNat (← row.getObjVal? "baselineNs")
+    let c ← positiveNat (← row.getObjVal? "soloCandidateNs")
+    return (b, c)
   return { siteIdx, declName, baselineNs, soloCandidateNs, hits, workloadPairs }
 
 private def validateAllCanonicalDecls (entries : List CorpusTimingSample) : Except String Unit := do
@@ -153,11 +151,7 @@ def parseCorpusBundle (raw : String) :
       if keys.contains "ablations" then do
         let aRows ← (← top.getObjVal? "ablations").getArr?
         let abls ← aRows.toList.mapM parseAblationEntry
-        let pairFields := aRows.toList.foldl (fun n row =>
-          match row.getObjVal? "workloadPairs" with
-          | .ok pairs => n + 1 + (pairs.getArr?.toOption.getD #[]).size * 2
-          | .error _ => n) 0
-        pure (abls, 1 + aRows.size * 5 + pairFields)
+        pure (abls, 1 + aRows.size * (6 + canonicalCorpusDeclNames.length * 2))
       else pure ([], 0)
     let expectedFields := 1 + cRows.size * 4 + abFields
     if fieldCount raw != expectedFields then throw "duplicate corpus/ablation fields are forbidden"
@@ -180,8 +174,25 @@ private def sampleValidCorpusJson : String :=
 #guard (parseCorpusBundle "[]").toOption.isNone
 #guard (parseCorpusBundle "[{\"declName\":\"collatz_steps\",\"baselineNs\":1000,\"candidateNs\":980,\"hits\":1}]").toOption.isNone
 #guard (parseCorpusBundle ("{\"corpus\":" ++ sampleValidCorpusJson ++
-  ",\"ablations\":[{\"siteIdx\":0,\"declName\":\"collatz_steps\",\"baselineNs\":1000,\"soloCandidateNs\":980,\"hits\":1}]}")).toOption.isSome
+  ",\"ablations\":[{\"siteIdx\":0,\"declName\":\"collatz_steps\",\"baselineNs\":1000,\"soloCandidateNs\":980,\"hits\":1}]}")).toOption.isNone
 #guard (parseCorpusBundle ("{\"corpus\":" ++ sampleValidCorpusJson ++ ",\"extra\":1}")).toOption.isNone
+
+private def sampleAblationBundle (pairs : List (Nat × Nat)) : String :=
+  "{\"corpus\":" ++ sampleValidCorpusJson ++
+  ",\"ablations\":[{\"siteIdx\":0,\"declName\":\"collatz_steps\",\"baselineNs\":10700,\"soloCandidateNs\":10400,\"hits\":1,\"workloadPairs\":[" ++
+  String.intercalate "," (pairs.map fun (b, c) =>
+    s!"\{\"baselineNs\":{b},\"soloCandidateNs\":{c}}") ++ "]}]}"
+
+#guard (parseCorpusBundle (sampleAblationBundle (List.replicate 8 (1000, 980)))).isOk
+#guard [0, 1, 7, 9].all fun n =>
+  !(parseCorpusBundle (sampleAblationBundle (List.replicate n (1000, 980)))).isOk
+#guard [(0, 980), (1000, 0)].all fun pair =>
+  !(parseCorpusBundle (sampleAblationBundle (pair :: List.replicate 7 (1000, 980)))).isOk
+#guard (parseCorpusBundle (sampleAblationBundle ((10000, 9000) :: List.replicate 7 (100, 200)))).toOption.all
+  (fun (_, ablations) => !keepDeclSiteByAblations ablations "collatz_steps" 8 0)
+#guard ["min_gpu_elements", "minGpuElements", "gpu_block_threads", "gpuBlockThreads",
+    "matmul_tile_dim", "matmulTileDim"].all fun op =>
+  !(parseSamples s!"[\{\"operation\":\"{op}\",\"elapsedNs\":100,\"iterations\":1}]").isOk
 
 @[noinline] private def runLoop (step : UInt64 → UInt64 → UInt64)
     (iterations seed : UInt64) : UInt64 := Id.run do
@@ -670,7 +681,7 @@ private def measureCompiledNativeCorpus (profile : HardwareCostProfile) (hostArc
       hits := soloReport.rewritesApplied
       workloadPairs := baseTimings.zip soloTimings |>.map (fun ((_, b), (_, c)) => (b, c))
     }]
-  let keepIdx := keepDeclSiteByAblations ablations
+  let keepIdx := fun decl => keepDeclSiteByAblations ablations decl canonicalCorpusDeclNames.length
   let (prunedMod, prunedReport, _) := superoptModuleSelective profile keepIdx m
   let _ ← IO.ofExcept (verifyAndAccumulateCorpus m prunedMod 4)
   let (candTimings, candHash) ← compileAndRunModuleHarness prunedMod hostArch "cand"
@@ -720,7 +731,8 @@ def run (args : List String) : IO UInt32 := do
     let (corpus, ablations, provExtra) ← match opts.corpusPath with
       | some cPath => do
         let (cEntries, cAblations) ← IO.ofExcept (parseCorpusBundle (← IO.FS.readFile cPath))
-        let (candMod, _, _) := superoptModuleSelective profile (keepDeclSiteByAblations cAblations) mkCanonicalBenchmarkModule8
+        let (candMod, _, _) := superoptModuleSelective profile
+          (fun decl => keepDeclSiteByAblations cAblations decl cEntries.length) mkCanonicalBenchmarkModule8
         let _ ← IO.ofExcept (verifyAndAccumulateCorpus mkCanonicalBenchmarkModule8 candMod 4)
         pure (cEntries, cAblations, [
           ("canonicalCorpusExecuted", .bool true),

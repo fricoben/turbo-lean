@@ -531,18 +531,25 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
   let baseRef := findFlagValue args "--base" "HEAD"
   let jsonFlag := hasFlag args "--json"
   let outPath := findFlagValue args "-o" ""
-  let specExists ← System.FilePath.pathExists "LeanNative/Spec.lean"
-  let testExists ← System.FilePath.pathExists "tests/test_runner.lean"
-  let specHashHex := blake3Hex (← if specExists then IO.FS.readFile "LeanNative/Spec.lean" else pure "")
-  let testHashHex := blake3Hex (← if testExists then IO.FS.readFile "tests/test_runner.lean" else pure "")
+  let root := if ← System.FilePath.pathExists "lean/LeanNative" then "lean/" else ""
+  let specPath := root ++ "LeanNative/Spec.lean"
+  let testPath := root ++ "LeanNative/Tests"
+  let specExists ← System.FilePath.pathExists specPath
+  let testFiles ← if ← System.FilePath.pathExists testPath then
+    (·.toList.filter (fun e => e.path.extension == some "lean")) <$> System.FilePath.readDir testPath
+    else pure []
+  let testExists := !testFiles.isEmpty
+  let specHashHex := blake3Hex (← if specExists then IO.FS.readFile specPath else pure "")
+  let testHashHex := blake3Hex (String.join (← (testFiles.mergeSort (fun a b => a.fileName ≤ b.fileName)).mapM
+    (fun e => return e.fileName ++ "\n" ++ (← IO.FS.readFile e.path))))
   let disallowSpecChanges := hasFlag args "--disallow-spec-changes"
   let mut specUnchanged := specExists
   let mut testUnchanged := testExists
   if disallowSpecChanges then
     try
-      let changedFiles := (← IO.Process.output { cmd := "git", args := #["diff", "--name-only", baseRef, "--", "LeanNative/Spec.lean", "tests/test_runner.lean"] }).stdout.trimAscii.toString
+      let changedFiles := (← IO.Process.output { cmd := "git", args := #["diff", "--name-only", baseRef, "--", specPath, testPath] }).stdout.trimAscii.toString
       if changedFiles.contains "LeanNative/Spec.lean" then specUnchanged := false
-      if changedFiles.contains "tests/test_runner.lean" then testUnchanged := false
+      if changedFiles.contains "LeanNative/Tests/" then testUnchanged := false
     catch _ => pure ()
   let baseMod := mkCanonicalBenchmarkModule
   let (optMod, pluginReport) := runSegregatedPluginPipeline .x86_64 true baseMod
