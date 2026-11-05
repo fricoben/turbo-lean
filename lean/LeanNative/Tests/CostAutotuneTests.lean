@@ -111,6 +111,20 @@ def evalDeclU64 (d : LNIRDecl) (a b c : UInt64) : Option UInt64 :=
 #guard meetsOnePercentE2EGain 1000 991 == false
 #guard meetsOnePercentE2EGain 0 0 == false
 
+#guard (let falsePositiveCorpus : List CorpusTimingSample :=
+          [ { baselineNs := 10000, candidateNs := 9700, hits := 1, declName := "k0" }
+          , { baselineNs := 100, candidateNs := 200, hits := 1, declName := "k1" } ]
+        let totals := aggregateCorpusTimings falsePositiveCorpus
+        let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples falsePositiveCorpus fmaModule
+        meetsOnePercentE2EGain totals.baselineNs totals.candidateNs == true &&
+        meetsCorpusGeomeanOnePercentGain falsePositiveCorpus == false &&
+        r.accepted == false && m' == fmaModule && r.profile == sm90Preset)
+
+#guard (let validGeomeanCorpus : List CorpusTimingSample :=
+          [ { baselineNs := 1000, candidateNs := 980, hits := 1, declName := "k0" }
+          , { baselineNs := 1000, candidateNs := 995, hits := 1, declName := "k1" } ]
+        meetsCorpusGeomeanOnePercentGain validGeomeanCorpus == true)
+
 #guard (let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 990, hits := 1 }] fmaModule
         r.accepted == true && m' != fmaModule && r.profile == calibrateHardwareProfile sm90Preset cudaHeavyFmaSamples)
@@ -126,6 +140,38 @@ def evalDeclU64 (d : LNIRDecl) (a b c : UInt64) : Option UInt64 :=
 #guard (let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 900, hits := 1 }] noopModule
         r.accepted == false && m' == noopModule && r.profile == sm90Preset)
+
+def fmaDecl2 : LNIRDecl := { fmaDecl with name := "autotune_fma_2" }
+def twoDeclMod : LNIRModule := { moduleName := "LeanNative.Tests.TwoSiteAblation", decls := [fmaDecl, fmaDecl2] }
+
+#guard (let abls : List CandidateAblationSample :=
+          [ { siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 980, hits := 1 }
+          , { siteIdx := 1, declName := "autotune_fma_2", baselineNs := 1000, soloCandidateNs := 995, hits := 1 } ]
+        let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
+          [{ baselineNs := 1000, candidateNs := 985, hits := 1 }] twoDeclMod abls
+        r.accepted == true && r.sitesConsidered == 2 && r.sitesPruned == 1 &&
+        m'.decls.length == 2 && m'.decls[0]! != fmaDecl && m'.decls[1]! == fmaDecl2)
+
+#guard (let allPrunedAbls : List CandidateAblationSample :=
+          [ { siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 995, hits := 1 } ]
+        let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
+          [{ baselineNs := 1000, candidateNs := 980, hits := 1 }] fmaModule allPrunedAbls
+        r.accepted == false && r.sitesConsidered == 1 && r.sitesPruned == 1 &&
+        m' == fmaModule && r.profile == sm90Preset)
+
+#guard (let m := mkCanonicalBenchmarkModule8
+        let mutatedEvm := m.decls.map fun d =>
+          if d.name == "evm_muldiv_wad_u256" then
+            { d with body := .letBind 99 .u256 (.constU256 (UInt256.ofUInt64 42)) (.ret 99) }
+          else d
+        !(LeanNative.Driver.CostAutotuneCLI.verifyAndAccumulateCorpus m { m with decls := mutatedEvm } 8).isOk)
+
+#guard (let m := mkCanonicalBenchmarkModule8
+        let mutatedSarray := m.decls.map fun d =>
+          if d.name == "saxpy_kernel" then
+            { d with body := .ret 0 }
+          else d
+        !(LeanNative.Driver.CostAutotuneCLI.verifyAndAccumulateCorpus m { m with decls := mutatedSarray } 8).isOk)
 
 #guard (let (d', r) := autotuneDeclWithAmdahl sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 990, hits := 1, declName := "autotune_fma" }] fmaDecl
@@ -161,6 +207,11 @@ def evalDeclU64 (d : LNIRDecl) (a b c : UInt64) : Option UInt64 :=
 #guard isRegisteredTheorem "LeanNative.Proofs.calibrateHardwareProfile_preserves_target" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.meetsOnePercentE2EGain_iff" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.meetsOnePercentE2EGain_rejects_subthreshold" == true
+#guard isRegisteredTheorem "LeanNative.Proofs.meetsCorpusGeomeanOnePercentGain_iff" == true
+#guard isRegisteredTheorem "LeanNative.Proofs.meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive" == true
+#guard isRegisteredTheorem "LeanNative.Proofs.superoptCodeSelective_sound" == true
+#guard isRegisteredTheorem "LeanNative.Proofs.superoptDeclSelective_sound" == true
+#guard isRegisteredTheorem "LeanNative.Proofs.superoptModuleSelective_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.superoptModuleWithCalibratedProfile_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.autotuneCodeWithAmdahl_sound" == true
 #guard isRegisteredTheorem "LeanNative.Proofs.autotuneCodeWithAmdahl_uncalibrated_preserves" == true

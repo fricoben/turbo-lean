@@ -473,7 +473,12 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.calibrateHardwareProfile_preserves_target
   , ``LeanNative.Proofs.meetsOnePercentE2EGain_iff
   , ``LeanNative.Proofs.meetsOnePercentE2EGain_rejects_subthreshold
+  , ``LeanNative.Proofs.meetsCorpusGeomeanOnePercentGain_iff
+  , ``LeanNative.Proofs.meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive
   , ``LeanNative.Proofs.superoptModuleWithCalibratedProfile_sound
+  , ``LeanNative.Proofs.superoptCodeSelective_sound
+  , ``LeanNative.Proofs.superoptDeclSelective_sound
+  , ``LeanNative.Proofs.superoptModuleSelective_sound
   , ``LeanNative.Proofs.autotuneCodeWithAmdahl_sound
   , ``LeanNative.Proofs.autotuneCodeWithAmdahl_uncalibrated_preserves
   , ``LeanNative.Proofs.autotuneDeclWithAmdahl_sound

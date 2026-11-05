@@ -290,15 +290,16 @@ def proofRetentionPass : TransformPass :=
   TransformPass.ofVerifiedContract proofRetentionContract
 
 def costAutotuneContract : VerifiedCodePassContract :=
-  verifiedCostAutotuneContract (HardwareCostProfile.forTarget .x86_64) [] []
+  verifiedCostAutotuneContract (HardwareCostProfile.forTarget .x86_64) [] [] []
     (LeanNative.Proofs.autotuneCodeWithAmdahl_sound
-      (HardwareCostProfile.forTarget .x86_64) [] [])
+      (HardwareCostProfile.forTarget .x86_64) [] [] [])
 
 def costAutotunePassFor (base : HardwareCostProfile) (samples : List OpTimingSample)
-    (corpus : List CorpusTimingSample) : TransformPass :=
+    (corpus : List CorpusTimingSample) (ablations : List CandidateAblationSample := []) :
+    TransformPass :=
   TransformPass.ofVerifiedContract
-    (verifiedCostAutotuneContract base samples corpus
-      (LeanNative.Proofs.autotuneCodeWithAmdahl_sound base samples corpus))
+    (verifiedCostAutotuneContract base samples corpus ablations
+      (LeanNative.Proofs.autotuneCodeWithAmdahl_sound base samples corpus ablations))
 
 def costAutotunePass : TransformPass :=
   TransformPass.ofVerifiedContract costAutotuneContract

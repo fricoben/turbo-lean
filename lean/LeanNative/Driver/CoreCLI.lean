@@ -57,7 +57,7 @@ def valueTakingFlags : List String :=
    "--emit-fixtures", "--fixtures", "--emit-asm", "--asm", "--telemetry-spool",
    "--decl", "--args", "--cases-file", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
    "--swift", "--emit-modulemap", "--modulemap", "--emit-xcframework", "--xcframework",
-   "--emit-swift-package-skeleton", "--base", "--artifact-bundle"]
+   "--emit-swift-package-skeleton", "--base", "--artifact-bundle", "--samples-json", "--corpus-json"]
 
 def validateValueTakingFlags : List String → IO Unit
   | [] => return ()
