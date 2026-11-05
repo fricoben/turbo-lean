@@ -4863,18 +4863,21 @@ fn check_and_audit_standalone_modules(
     let olean_out_dir = staging_dir.join("oleans");
     fs::create_dir_all(&olean_out_dir)?;
 
-    // Populate `olean_out_dir` with hard links (falling back to copies) of target-owned `.olean`
-    // files from root/dependency `.lake/build/lib/lean` directories so `olean_out_dir` can sit
-    // FIRST on `LEAN_PATH`. In Lean 4's `SearchPath.findWithExt`, a matching top-level subdirectory
+    // Populate `olean_out_dir` with hard links (falling back to copies; always copying when
+    // `preserve_lake` is active so `.lake` link counts and `ctime` stay untouched) of target-owned
+    // `.olean` files from root/dependency `.lake/build/lib/lean` directories so `olean_out_dir` can
+    // sit FIRST on `LEAN_PATH`. In Lean 4's `SearchPath.findWithExt`, a matching top-level subdirectory
     // (e.g. `TurboLean/` in `.lake/build/lib/lean`) pins module resolution (`TurboLean.olean` AND
     // `TurboLean.Spec`) to the first directory containing either `TurboLean/` or `TurboLean.olean`.
     // Merging target-owned `.olean`s into `olean_out_dir` lets both `TurboLean.olean` and
     // `TurboLean/Spec.olean` resolve cleanly without touching `.lake` (preserving
     // `--no-auto-worktree-link` snapshots) while never copying unverified non-target `.olean`s.
+    let preserve_lake = worktree_auto_link_disabled(canon_dir);
     let merge_pkg_oleans = |pkg: &crate::module_builder::PackageConfig,
                             is_root: bool,
                             dst_dir: &Path|
      -> Result<()> {
+        let pkg_preserve_lake = preserve_lake || worktree_auto_link_disabled(&pkg.pkg_root);
         let src_dir = pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
         if !src_dir.is_dir() {
             return Ok(());
@@ -4930,7 +4933,7 @@ fn check_and_audit_standalone_modules(
                     if let Some(parent) = dst_p.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    if fs::hard_link(&p, &dst_p).is_err() {
+                    if pkg_preserve_lake || fs::hard_link(&p, &dst_p).is_err() {
                         fs::copy(&p, &dst_p)?;
                     }
                 }

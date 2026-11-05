@@ -8032,7 +8032,9 @@ fn load_cached_pkg_manifest<'a>(
                         && m.lake_inputs_digest == expected_lake_inputs
                         && (!strict_policy
                             || (m.workspace_config_digest == cfg.canonical_config_digest
-                                && m.allowed_axioms == crate::splitter::allowed_axioms())) =>
+                                && m.allowed_axioms == crate::splitter::allowed_axioms()
+                                && m.kernel_policy_digest
+                                    == crate::splitter::current_kernel_policy_digest())) =>
                 {
                     Some(m.clone())
                 }
@@ -19802,7 +19804,8 @@ fn probe_warm_on_disk_module_candidate(
             && m.lake_inputs_digest == expected_ws_inputs
             && (!node.is_root_pkg
                 || (m.workspace_config_digest == cfg.canonical_config_digest
-                    && m.allowed_axioms == crate::splitter::allowed_axioms()))
+                    && m.allowed_axioms == crate::splitter::allowed_axioms()
+                    && m.kernel_policy_digest == crate::splitter::current_kernel_policy_digest()))
         {
             m.modules.get(&rel_src)
         } else {
@@ -21244,7 +21247,10 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
         }
         let prev_kernel_audited = existing_manifests
             .get(&pkg_root)
-            .filter(|m| m.allowed_axioms == allowed_axioms)
+            .filter(|m| {
+                m.allowed_axioms == allowed_axioms
+                    && m.kernel_policy_digest == kernel_policy_digest
+            })
             .and_then(|m| m.modules.get(&rel_src))
             .is_some_and(|e| {
                 e.kernel_audited && e.src_blake3 == src_b3 && e.olean_artifact_digest == olean_dig
@@ -27248,6 +27254,61 @@ lean_lib Smoke where
         assert!(
             !import_pin_current(&cfg, &memo, "DepPkg.B", Some(dep_b_pin)),
             "`import_pin_current` accepted unaudited `App.R` via non-strict memo"
+        );
+
+        // Repeat for `kernel_policy_digest` shifts (`TURBO_LEAN_ALLOWED_UNSAFE` without changing
+        // `allowed_axioms`): `load_cached_pkg_manifest` (`strict_policy`), warm adoption, and
+        // `hydrate_project_traces` must all reject/clear stale `kernel_audited` bits.
+        std::env::set_var("TURBO_LEAN_ALLOWED_UNSAFE", "rootU");
+        fs::write(proj_dir.join("App/U.lean"), "unsafe def rootU : Nat := 1\n").unwrap();
+        build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        std::env::remove_var("TURBO_LEAN_ALLOWED_UNSAFE");
+        // Before rewriting the manifest, `import_pin_current` (`strict_policy = true` via
+        // `load_cached_pkg_manifest`) must reject `DepPkg.B -> App.R` because `App`'s manifest has
+        // a stale `kernel_policy_digest`.
+        let cfg_post = resolve_project_config(&canon).unwrap();
+        let memo_post = DepImportMemo::default();
+        let dep_manifest_post: VerifiedDepManifest = serde_json::from_slice(
+            &fs::read(dep_dir.join(".lake/build/.turbo_verified_sources.json")).unwrap(),
+        )
+        .unwrap();
+        let dep_b_pin_post = &dep_manifest_post.modules["DepPkg/B.lean"].olean_artifact_digest;
+        assert!(
+            !import_pin_current(&cfg_post, &memo_post, "DepPkg.B", Some(dep_b_pin_post)),
+            "`import_pin_current` accepted stale `kernel_policy_digest` in `load_cached_pkg_manifest`"
+        );
+        hydrate_project_traces(&canon).unwrap();
+        let hydrated_manifest: VerifiedDepManifest = serde_json::from_slice(
+            &fs::read(crate::lake_build::verified_sources_manifest_path(&canon)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hydrated_manifest.kernel_policy_digest,
+            crate::splitter::current_kernel_policy_digest()
+        );
+        assert!(
+            !hydrated_manifest.modules["App/U.lean"].kernel_audited,
+            "`hydrate_project_traces` preserved stale `kernel_audited` across `kernel_policy_digest` shift"
+        );
+        let u_chk = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj_dir.join("App/U.lean"),
+            None,
+            proj_dir.clone(),
+        );
+        assert!(
+            u_chk.is_err(),
+            "`check` accepted `unsafe def` after `TURBO_LEAN_ALLOWED_UNSAFE` was cleared"
         );
         let _ = fs::remove_dir_all(&dir);
     }

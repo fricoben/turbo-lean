@@ -660,8 +660,8 @@ pub fn ensure_verified_private_staging_dir(subdir: Option<&str>) -> Option<PathB
 }
 
 /// Read `staging_shm_dir()/<subdir>/<file_name>` fail-closed WITHOUT mutating permissions:
-/// returns `None` if `base`, `subdir`, or `file_name` is a symlink, not owned by `geteuid()`,
-/// or has any group/other permission bits (`(mode & 0o077) != 0`).
+/// returns `None` if `base`, `subdir`, or `file_name` is a symlink, multiply linked (`nlink != 1`),
+/// not owned by `geteuid()`, or has any group/other permission bits (`(mode & 0o077) != 0`).
 pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<Vec<u8>> {
     if !is_safe_single_shm_segment(subdir) || !is_safe_single_shm_segment(file_name) {
         return None;
@@ -686,7 +686,11 @@ pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<V
         let mut f = opts.open(&file_path).ok()?;
         let meta = f.metadata().ok()?;
         let euid = unsafe { libc::geteuid() };
-        if !meta.file_type().is_file() || meta.uid() != euid || (meta.mode() & 0o077) != 0 {
+        if !meta.file_type().is_file()
+            || meta.nlink() != 1
+            || meta.uid() != euid
+            || (meta.mode() & 0o077) != 0
+        {
             return None;
         }
         if !inode_matches_nofollow(&f, &file_path) {
@@ -2376,6 +2380,44 @@ mod tests {
                     "write_verified_private_shm_file must refuse symlink target"
                 );
                 assert_all_caches_miss_and_recompute_truth()?;
+
+                // 4b. Hardlinked cache files (`nlink > 1`) inside `0o700` subdirs must be rejected
+                //     on read (`read_verified_private_shm_file` returns `None`) and atomically
+                //     unlinked/replaced via rename on write without mutating the external hardlink.
+                for (p, payload) in [
+                    (&sh_path, &forged_sh_bytes),
+                    (&om_path, &forged_om_bytes),
+                    (&oi_path, &forged_oi_bytes),
+                ] {
+                    let ext_hl =
+                        root.join(format!("ext_hl_{}", p.file_name().unwrap().to_string_lossy()));
+                    fs::write(&ext_hl, payload)?;
+                    fs::set_permissions(&ext_hl, fs::Permissions::from_mode(0o600))?;
+                    let _ = fs::remove_file(p);
+                    fs::hard_link(&ext_hl, p)?;
+                }
+                assert!(
+                    read_verified_private_shm_file(
+                        "src_hygiene_v1",
+                        sh_path.file_name().unwrap().to_str().unwrap()
+                    )
+                    .is_none(),
+                    "read_verified_private_shm_file must reject hardlinked file (nlink > 1)"
+                );
+                assert_all_caches_miss_and_recompute_truth()?;
+                for (p, payload) in [
+                    (&sh_path, &forged_sh_bytes),
+                    (&om_path, &forged_om_bytes),
+                    (&oi_path, &forged_oi_bytes),
+                ] {
+                    let ext_hl =
+                        root.join(format!("ext_hl_{}", p.file_name().unwrap().to_string_lossy()));
+                    assert_eq!(
+                        fs::read(&ext_hl)?,
+                        *payload,
+                        "atomic rename must not mutate external hardlink target"
+                    );
+                }
 
                 // 5. Symlinked `TURBO_LEAN_STAGING_DIR` must be rejected by both private SHM
                 //    helpers AND `TurboStore::fast_staging_dir()` (which must fall back to
