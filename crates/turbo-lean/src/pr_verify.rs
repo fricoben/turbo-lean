@@ -3604,18 +3604,19 @@ fn run_lean_temp_file(
         let pid = std::process::id();
         let seq = pack::next_tmp_id();
         let nonce = format!("pr_{}_{}", pid, seq);
+        let scratch_base = crate::check::verified_private_temp_scratch_base()?;
         let src_dir = crate::check::PrivateScratchDir::create_with_nonce(
-            &std::env::temp_dir(),
+            &scratch_base,
             "turbo_pr_src",
             nonce.clone(),
         )?;
         let out_dir = crate::check::PrivateScratchDir::create_with_nonce(
-            &std::env::temp_dir(),
+            &scratch_base,
             "turbo_pr_out",
             nonce.clone(),
         )?;
         let reader_dir = crate::check::PrivateScratchDir::create_with_nonce(
-            &std::env::temp_dir(),
+            &scratch_base,
             "turbo_pr_rdr",
             nonce.clone(),
         )?;

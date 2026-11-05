@@ -77,6 +77,18 @@ fn match_expected_decl_identity(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Return a per-UID `0700` scratch base inside `std::env::temp_dir()` when every ancestor is
+/// owned by `root` or `geteuid()` and only sticky when writable by others (falling back to
+/// `ensure_verified_private_staging_dir(Some("scratch"))`).
+pub(crate) fn verified_private_temp_scratch_base() -> Result<PathBuf> {
+    if let Some(dir) = crate::zygote::private_temp_subdir("turbo_lean_scratch") {
+        return Ok(dir);
+    }
+    crate::shm_cache::ensure_verified_private_staging_dir(Some("scratch")).ok_or_else(|| {
+        anyhow::anyhow!("Failed to establish a verified private (0700) temporary scratch root")
+    })
+}
+
 fn compile_and_read_probe_identities(
     probe: &str,
     project_dir: &Path,
@@ -91,12 +103,13 @@ fn compile_and_read_probe_identities(
     // Three disjoint private (0700, exclusively created) scratch directories separate
     // read-only probe input (`src_scratch`), compiler output (`out_scratch`), and the
     // trusted reader's frozen `.olean` copy (`reader_scratch`).
-    let src_scratch = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_id_src")?;
+    let scratch_base = verified_private_temp_scratch_base()?;
+    let src_scratch = PrivateScratchDir::create(&scratch_base, "turbo_id_src")?;
     let nonce = src_scratch.nonce.clone();
     let out_scratch =
-        PrivateScratchDir::create_with_nonce(&std::env::temp_dir(), "turbo_id_out", nonce.clone())?;
+        PrivateScratchDir::create_with_nonce(&scratch_base, "turbo_id_out", nonce.clone())?;
     let reader_scratch =
-        PrivateScratchDir::create_with_nonce(&std::env::temp_dir(), "turbo_id_rdr", nonce.clone())?;
+        PrivateScratchDir::create_with_nonce(&scratch_base, "turbo_id_rdr", nonce.clone())?;
     let probe_nonce = format!("id_{nonce}");
     let result = (|| -> Result<Vec<OleanDeclEntry>> {
         let module = format!("TurboIdentityProbe_{nonce}");
@@ -7249,7 +7262,10 @@ but is expected to have type
 
     #[test]
     fn test_read_single_isolated_olean_rejects_extra_files_symlinks_and_hardlinks() -> Result<()> {
-        let scratch = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_iso_olean_test")?;
+        let scratch = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "turbo_iso_olean_test",
+        )?;
         let out_dir = scratch.path.join("out");
         fs::create_dir_all(&out_dir)?;
 
@@ -7300,7 +7316,10 @@ but is expected to have type
     #[cfg(unix)]
     fn test_post_exit_background_child_reaped_and_frozen_dir_blocks_overwrite() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let scratch = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_bg_reap_test")?;
+        let scratch = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "turbo_bg_reap_test",
+        )?;
         let out_dir = scratch.path.join("out");
         fs::create_dir_all(&out_dir)?;
         let expected = out_dir.join("Mod.olean");
@@ -7601,7 +7620,10 @@ theorem after_macro : ext_magic = 7 := rfl
         assert_eq!(mod_atts[1].decl_name, "priv_mod_thm");
 
         // Stage isolated module artifacts rejects unexpected files while accepting `.olean.{server,private}` and `.ir{,.sig}`.
-        let iso = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_iso_mod_test")?;
+        let iso = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "turbo_iso_mod_test",
+        )?;
         let out_m = iso.path.join("out");
         let rdr_m = iso.path.join("rdr");
         fs::create_dir_all(&out_m)?;

@@ -197,7 +197,12 @@ fn ensure_dir_all_inner(dir: &Path, require_private_leaf: bool) -> std::io::Resu
             builder.recursive(true).mode(0o700);
             match builder.create(dir) {
                 Ok(()) => {
-                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+                    let mut opts = fs::OpenOptions::new();
+                    opts.read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+                    if let Ok(created_f) = opts.open(dir) {
+                        let _ = created_f.set_permissions(fs::Permissions::from_mode(0o700));
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
@@ -675,7 +680,7 @@ fn is_safe_single_shm_segment(seg: &str) -> bool {
 
 #[cfg(unix)]
 fn verify_or_create_private_dir_one(dir: &Path, create_if_missing: bool) -> Option<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
     match fs::symlink_metadata(dir) {
         Ok(sym_meta) => {
@@ -687,8 +692,11 @@ fn verify_or_create_private_dir_one(dir: &Path, create_if_missing: bool) -> Opti
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
             builder.create(dir).ok()?;
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            let mut opts = fs::OpenOptions::new();
+            opts.read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+            let created_f = opts.open(dir).ok()?;
+            let _ = created_f.set_permissions(fs::Permissions::from_mode(0o700));
         }
         Err(_) => return None,
     }
@@ -857,12 +865,22 @@ pub(crate) struct StagingLeaseGuard {
     _lease: Option<FlockGuard>,
 }
 
+fn ensure_lease_or_staging_parent_dir(parent: &Path) -> std::io::Result<()> {
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        return Ok(());
+    }
+    let base = staging_shm_dir();
+    if parent == base || parent.starts_with(&base) {
+        ensure_private_dir_all(parent)
+    } else {
+        ensure_nonsymlink_dir_all(parent)
+    }
+}
+
 impl StagingLeaseGuard {
     pub(crate) fn acquire_for_target(target: &Path) -> std::io::Result<Self> {
         if let Some(parent) = target.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_lease_or_staging_parent_dir(parent)?;
         }
         #[cfg(unix)]
         let mut dir_lease = lock_staging_parent_dir(target, false, false)?;
@@ -924,9 +942,7 @@ impl StagedTempFile {
 
     fn stage_with_lease(path: PathBuf, bytes: &[u8]) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_lease_or_staging_parent_dir(parent)?;
         }
         #[cfg(unix)]
         let mut dir_lease = lock_staging_parent_dir(&path, false, false)?;
@@ -1124,7 +1140,7 @@ thread_local! {
 fn acquire_staging_lease(lock_path: &Path) -> std::io::Result<Option<FlockGuard>> {
     for attempt in 0..4096u32 {
         if let Some(parent) = lock_path.parent() {
-            ensure_private_dir_all(parent)?;
+            ensure_lease_or_staging_parent_dir(parent)?;
         }
         let mut opts = fs::OpenOptions::new();
         opts.create(true).read(true).write(true).truncate(false);
@@ -1846,6 +1862,12 @@ mod tests {
         let shm_dir = base_dir.join("shm");
         let spill_dir = base_dir.join("disk_spill");
         fs::create_dir_all(&shm_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&shm_dir, fs::Permissions::from_mode(0o700))?;
+        }
 
         let f_old = shm_dir.join("entry_old.json");
         let f_mid = shm_dir.join("entry_mid.json");
@@ -1932,6 +1954,7 @@ mod tests {
         let det_target = staging.join("deterministic_race.lean");
         let det_lock = staging_lease_lock_path(&det_target);
         fs::create_dir_all(&staging)?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
         let reaper_blocked_mid_open = std::rc::Rc::new(std::cell::Cell::new(false));
         let reaper_flag = reaper_blocked_mid_open.clone();
         let det_target_for_hook = det_target.clone();
@@ -2311,7 +2334,7 @@ mod tests {
                     .join("olean_meta_v2")
                     .join(format!("om_{om_key}.json"));
                 let oi_path = staging
-                    .join("olean_iface_v1")
+                    .join("olean_iface_v2")
                     .join(format!("oi_{om_key}.json"));
                 assert_eq!(fs::symlink_metadata(&sh_path)?.mode() & 0o777, 0o600);
                 assert_eq!(fs::symlink_metadata(&om_path)?.mode() & 0o777, 0o600);
@@ -2367,7 +2390,7 @@ mod tests {
                         .expect("recomputed iface digest");
                     anyhow::ensure!(
                         idig == real_iface_dig && ideps == real_iface_deps,
-                        "forged olean_iface_v1 entry was trusted: {idig} / {ideps:?}"
+                        "forged olean_iface_v2 entry was trusted: {idig} / {ideps:?}"
                     );
                     Ok(())
                 };
@@ -2404,7 +2427,7 @@ mod tests {
                 fs::set_permissions(&om_path, fs::Permissions::from_mode(0o600))?;
                 fs::write(&oi_path, &forged_oi_bytes)?;
                 fs::set_permissions(&oi_path, fs::Permissions::from_mode(0o600))?;
-                for sub in ["src_hygiene_v2", "olean_meta_v2", "olean_iface_v1"] {
+                for sub in ["src_hygiene_v2", "olean_meta_v2", "olean_iface_v2"] {
                     fs::set_permissions(staging.join(sub), fs::Permissions::from_mode(0o755))?;
                 }
                 assert!(ensure_verified_private_staging_dir(Some("src_hygiene_v2")).is_none());
@@ -2414,7 +2437,7 @@ mod tests {
                     "verify must never chmod an untrusted 0o755 directory"
                 );
                 assert_all_caches_miss_and_recompute_truth()?;
-                for sub in ["src_hygiene_v2", "olean_meta_v2", "olean_iface_v1"] {
+                for sub in ["src_hygiene_v2", "olean_meta_v2", "olean_iface_v2"] {
                     fs::set_permissions(staging.join(sub), fs::Permissions::from_mode(0o700))?;
                 }
 
@@ -2534,17 +2557,32 @@ mod tests {
                 assert!(ensure_private_dir_all(&perm755_staging).is_err());
                 assert!(acquire_flock(&perm755_staging.join("x.lock"), true, false).is_err());
                 assert!(atomic_write_shm(&perm755_staging.join("x.json"), b"{}").is_err());
+                assert!(StagingLeaseGuard::acquire_for_target(&perm755_staging.join("x.lean")).is_err());
+                assert!(StagedTempFile::write(perm755_staging.join("x.lean"), b"x").is_err());
                 assert_eq!(
                     fs::symlink_metadata(&perm755_staging)?.mode() & 0o777,
                     0o755,
                     "ensure_private_dir_all must not chmod an existing 0o755 directory"
                 );
+                // Meanwhile, `PrivateScratchDir` under `verified_private_temp_scratch_base()`
+                // and under a `0o755` non-staging temporary directory must succeed cleanly.
+                let priv_scratch_base = crate::check::verified_private_temp_scratch_base()?;
+                assert_eq!(fs::symlink_metadata(&priv_scratch_base)?.mode() & 0o777, 0o700);
+                let psd_tmp = crate::check::PrivateScratchDir::create(&priv_scratch_base, "turbo_tmp_test")?;
+                assert_eq!(fs::symlink_metadata(&psd_tmp.path)?.mode() & 0o777, 0o700);
+                drop(psd_tmp);
+                let non_staging_755 = root.join("non_staging_755");
+                fs::create_dir_all(&non_staging_755)?;
+                fs::set_permissions(&non_staging_755, fs::Permissions::from_mode(0o755))?;
+                let psd_755 = crate::check::PrivateScratchDir::create(&non_staging_755, "turbo_755_test")?;
+                assert_eq!(fs::symlink_metadata(&psd_755.path)?.mode() & 0o777, 0o700);
+                drop(psd_755);
 
                 // 6. Coarse-timestamp / trust-window regression across persistent SHM & in-memory
-                //    replay-authority and source-hygiene caches:
+                //    replay-authority, interface, and source-hygiene caches:
                 //    a same-length rewrite within a single 1s coarse timestamp tick must NEVER
-                //    return a stale replay digest, binary-import list, artifact-set digest, or
-                //    source-hygiene verdict.
+                //    return a stale replay digest, binary-import list, artifact-set digest,
+                //    single-olean interface digest, or source-hygiene / source-blake3 verdict.
                 let private_staging = root.join("coarse_staging");
                 std::env::set_var("TURBO_LEAN_STAGING_DIR", &private_staging);
                 crate::zygote::digest_test_hooks::FORCED_TS_GRANULARITY_NS
@@ -2555,17 +2593,20 @@ mod tests {
                 let coarse_olean = root.join("CoarseReplay.olean");
                 let mut olean_v1 = make_valid_large_olean();
                 let mut olean_v2 = olean_v1.clone();
-                // Same length (70_000 bytes), different payload byte in trailing body AND different import (`Core` vs `Init`).
-                olean_v1[69_999] = 0x11;
-                olean_v2[69_999] = 0x22;
+                // Same length (70_000 bytes), interior byte edit at offset 35_000 (outside 4 KiB head/tail sample!) AND different import (`Core` vs `Init`).
+                olean_v1[35_000] = 0x11;
+                olean_v2[35_000] = 0x22;
                 olean_v2[264 + 32..264 + 36].copy_from_slice(b"Core");
                 fs::write(&coarse_olean, &olean_v1)?;
                 let coarse_src = root.join("CoarseHygiene.lean");
-                // Same byte length (36 bytes): clean vs sorry!
-                let src_v1 = "theorem coarse_t : True := trivial \n";
-                let src_v2 = "theorem coarse_t : True := by sorry\n";
+                // Same byte length (70_000 bytes, interior edit outside 4 KiB head/tail sample): clean vs sorry!
+                let pad_prefix = format!("-- {}\n", "a".repeat(34_900));
+                let pad_suffix = format!("-- {}\n", "b".repeat(35_050));
+                let src_v1 = format!("{pad_prefix}theorem coarse_t : True := trivial \n{pad_suffix}");
+                let src_v2 = format!("{pad_prefix}theorem coarse_t : True := by sorry\n{pad_suffix}");
                 assert_eq!(src_v1.len(), src_v2.len());
-                fs::write(&coarse_src, src_v1)?;
+                assert!(src_v1.len() > 65536);
+                fs::write(&coarse_src, &src_v1)?;
 
                 let d_v1 =
                     crate::module_builder::compute_replayed_olean_ilean_digest(&coarse_olean)?;
@@ -2573,13 +2614,23 @@ mod tests {
                     crate::module_builder::compute_olean_artifact_set_digest(&coarse_olean)?;
                 let (imps_v1, _) =
                     crate::module_builder::read_olean_binary_imports_cached(&coarse_olean)?;
+                let coarse_comp = crate::lake_build::single_olean_companion_paths(&coarse_olean);
+                let (iface_v1, _, _) =
+                    crate::lake_build::compute_single_olean_digest_and_imports_with_stats(
+                        &coarse_olean,
+                        &coarse_comp,
+                        crate::lake_build::single_olean_stat_bundle(&coarse_olean, &coarse_comp),
+                    )
+                    .expect("coarse iface v1");
+                let sb3_v1 = crate::lake_build::compute_cached_source_blake3(&coarse_src)
+                    .expect("coarse src blake3 v1");
                 let hyg_v1 = crate::module_builder::load_source_hygiene_cached(&coarse_src)?;
                 assert_eq!(imps_v1[0].module, "Init");
                 assert!(hyg_v1.is_clean_for_certification());
 
                 // Same-length rewrite inside the same 1s tick (and within STAT_TRUST_WINDOW_NS):
                 fs::write(&coarse_olean, &olean_v2)?;
-                fs::write(&coarse_src, src_v2)?;
+                fs::write(&coarse_src, &src_v2)?;
                 // Verify both in-memory (same memo window) AND across memo-window reset (SHM):
                 for reset in [false, true] {
                     if reset {
@@ -2591,6 +2642,15 @@ mod tests {
                         crate::module_builder::compute_olean_artifact_set_digest(&coarse_olean)?;
                     let (imps_v2, _) =
                         crate::module_builder::read_olean_binary_imports_cached(&coarse_olean)?;
+                    let (iface_v2, _, _) =
+                        crate::lake_build::compute_single_olean_digest_and_imports_with_stats(
+                            &coarse_olean,
+                            &coarse_comp,
+                            crate::lake_build::single_olean_stat_bundle(&coarse_olean, &coarse_comp),
+                        )
+                        .expect("coarse iface v2");
+                    let sb3_v2 = crate::lake_build::compute_cached_source_blake3(&coarse_src)
+                        .expect("coarse src blake3 v2");
                     let hyg_v2 = crate::module_builder::load_source_hygiene_cached(&coarse_src)?;
                     assert_ne!(
                         d_v1, d_v2,
@@ -2599,6 +2659,14 @@ mod tests {
                     assert_ne!(
                         aset_v1, aset_v2,
                         "same-length coarse-tick rewrite must rehash artifact-set digest (reset={reset})"
+                    );
+                    assert_ne!(
+                        iface_v1, iface_v2,
+                        "same-length coarse-tick interior rewrite must rehash single-olean interface digest (reset={reset})"
+                    );
+                    assert_ne!(
+                        sb3_v1, sb3_v2,
+                        "same-length coarse-tick interior rewrite must rehash cached source blake3 (reset={reset})"
                     );
                     assert_eq!(
                         imps_v2[0].module, "Core",

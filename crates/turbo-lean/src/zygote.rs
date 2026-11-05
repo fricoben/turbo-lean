@@ -3139,6 +3139,14 @@ pub(crate) fn private_shared_zygote_dir() -> Option<PathBuf> {
 }
 
 fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
+    private_temp_subdir_in(base, "turbo_lean_shared_zygote_bins")
+}
+
+pub(crate) fn private_temp_subdir(prefix: &str) -> Option<PathBuf> {
+    private_temp_subdir_in(&std::env::temp_dir(), prefix)
+}
+
+fn private_temp_subdir_in(base: &Path, prefix: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
@@ -3157,7 +3165,7 @@ fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
                 return None;
             }
         }
-        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        let dir = base.join(format!("{prefix}_{uid}"));
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -3167,7 +3175,7 @@ fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
     };
     #[cfg(not(unix))]
     let dir = {
-        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        let dir = base.join(format!("{prefix}_{uid}"));
         let _ = fs::create_dir_all(&dir);
         dir
     };

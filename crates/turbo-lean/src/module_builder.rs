@@ -8191,23 +8191,38 @@ fn olean_digest_is(_cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
     compute_olean_artifact_set_digest_with_policy(olean, true).is_ok_and(|d| d == pin)
 }
 
-/// Inode/size/mtime/ctime fingerprint of an `.olean` artifact set. Any rewrite, replacement,
-/// or timestamp reset changes `ctime`, so an unchanged fingerprint implies unchanged bytes.
-fn olean_artifact_stat_fingerprint(olean: &Path) -> Option<String> {
+/// Device/inode/size/mtime/ctime fingerprint of an `.olean` artifact set, returned only when
+/// every present artifact is a non-symlink regular file on a subsecond-timestamp filesystem
+/// (`check_age == true` additionally requires `olean_stat_sig_trusted_at(&sig, now_ns)` before
+/// recording a persistent fingerprint).
+fn olean_artifact_stat_fingerprint_inner(olean: &Path, check_age: bool) -> Option<String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        let now_ns = if check_age {
+            crate::zygote::wall_clock_ns()
+        } else {
+            0
+        };
         let mut h = blake3::Hasher::new();
         for (tag, path) in olean_artifact_paths(olean) {
             h.update(tag.as_bytes());
-            match fs::metadata(&path) {
-                Ok(m) => {
-                    for v in [m.ino() as i64, m.len() as i64, m.mtime(), m.mtime_nsec()] {
-                        h.update(&v.to_le_bytes());
+            match fs::symlink_metadata(&path) {
+                Ok(m) if !m.file_type().is_symlink() && m.is_file() => {
+                    let sig = crate::zygote::OleanFileStatSig::from_meta(&m);
+                    if !crate::zygote::dev_records_subsecond_timestamps(&sig)
+                        || (check_age && !olean_stat_sig_trusted_at(&sig, now_ns))
+                    {
+                        return None;
                     }
-                    h.update(&m.ctime().to_le_bytes());
-                    h.update(&m.ctime_nsec().to_le_bytes());
+                    h.update(&sig.dev.to_le_bytes());
+                    h.update(&sig.ino.to_le_bytes());
+                    h.update(&sig.size.to_le_bytes());
+                    h.update(&sig.mtime_sec.to_le_bytes());
+                    h.update(&sig.mtime_nsec.to_le_bytes());
+                    h.update(&sig.ctime_sec.to_le_bytes());
+                    h.update(&sig.ctime_nsec.to_le_bytes());
                 }
+                Ok(_) => return None,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     h.update(b"-");
                 }
@@ -8218,9 +8233,17 @@ fn olean_artifact_stat_fingerprint(olean: &Path) -> Option<String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = olean;
+        let _ = (olean, check_age);
         None
     }
+}
+
+fn olean_artifact_stat_fingerprint(olean: &Path) -> Option<String> {
+    olean_artifact_stat_fingerprint_inner(olean, false)
+}
+
+fn olean_artifact_stat_fingerprint_for_store(olean: &Path) -> Option<String> {
+    olean_artifact_stat_fingerprint_inner(olean, true)
 }
 
 /// Whether the `.olean` artifact set at `olean` still matches `entry`: by its recorded stat
@@ -13981,7 +14004,7 @@ pub(crate) fn path_stat_fingerprint(path: &Path) -> FileStatFingerprint {
 }
 
 #[inline]
-fn path_olean_stat_sig(path: &Path) -> Option<crate::zygote::OleanFileStatSig> {
+pub(crate) fn path_olean_stat_sig(path: &Path) -> Option<crate::zygote::OleanFileStatSig> {
     let meta = fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
@@ -13990,7 +14013,38 @@ fn path_olean_stat_sig(path: &Path) -> Option<crate::zygote::OleanFileStatSig> {
 }
 
 #[inline]
-fn olean_stat_sig_trusted_at(
+pub(crate) fn read_regular_file_bound_stat(
+    path: &Path,
+) -> std::io::Result<(
+    crate::zygote::OleanFileStatSig,
+    Vec<u8>,
+    crate::zygote::OleanFileStatSig,
+)> {
+    use std::io::Read;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path)?;
+    let pre_meta = f.metadata()?;
+    if !pre_meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("`{}` is not a regular file", path.display()),
+        ));
+    }
+    let pre = crate::zygote::OleanFileStatSig::from_meta(&pre_meta);
+    let mut bytes = Vec::with_capacity(pre.size as usize);
+    f.read_to_end(&mut bytes)?;
+    let post = crate::zygote::OleanFileStatSig::from_meta(&f.metadata()?);
+    Ok((pre, bytes, post))
+}
+
+#[inline]
+pub(crate) fn olean_stat_sig_trusted_at(
     sig: &crate::zygote::OleanFileStatSig,
     read_started_ns: i128,
 ) -> bool {
@@ -14000,7 +14054,7 @@ fn olean_stat_sig_trusted_at(
 }
 
 #[inline]
-fn olean_stat_bundle_trusted_for_reuse(
+pub(crate) fn olean_stat_bundle_trusted_for_reuse(
     sigs: &[Option<crate::zygote::OleanFileStatSig>; 4],
 ) -> bool {
     sigs[0].is_some_and(|s| s.size > 0)
@@ -14011,7 +14065,7 @@ fn olean_stat_bundle_trusted_for_reuse(
 }
 
 #[inline]
-fn olean_stat_bundle_trusted_to_store(
+pub(crate) fn olean_stat_bundle_trusted_to_store(
     sigs: &[Option<crate::zygote::OleanFileStatSig>; 4],
     read_started_ns: i128,
 ) -> bool {
@@ -14023,7 +14077,7 @@ fn olean_stat_bundle_trusted_to_store(
 }
 
 #[inline]
-fn olean_stat_bundle6_trusted_for_reuse(
+pub(crate) fn olean_stat_bundle6_trusted_for_reuse(
     sigs: &[Option<crate::zygote::OleanFileStatSig>; 6],
 ) -> bool {
     sigs[0].is_some_and(|s| s.size > 0)
@@ -14034,7 +14088,7 @@ fn olean_stat_bundle6_trusted_for_reuse(
 }
 
 #[inline]
-fn olean_stat_bundle6_trusted_to_store(
+pub(crate) fn olean_stat_bundle6_trusted_to_store(
     sigs: &[Option<crate::zygote::OleanFileStatSig>; 6],
     read_started_ns: i128,
 ) -> bool {
@@ -14332,10 +14386,16 @@ pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::Hy
         None
     };
     let read_started_ns = crate::zygote::wall_clock_ns();
-    let src = fs::read_to_string(src_path)?;
+    let (fd_pre, raw_bytes, fd_post) = read_regular_file_bound_stat(src_path)?;
+    let src = String::from_utf8(raw_bytes)
+        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in `{}`: {e}", src_path.display()))?;
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
     if let (Some(file_name), Some(post_st)) = (cache_file_name, path_olean_stat_sig(src_path)) {
-        if Some(post_st) == cur_stat && olean_stat_sig_trusted_at(&post_st, read_started_ns) {
+        if fd_pre == fd_post
+            && Some(fd_pre) == cur_stat
+            && post_st == fd_post
+            && olean_stat_sig_trusted_at(&post_st, read_started_ns)
+        {
             let entry = ShmSourceHygieneEntry {
                 stat: post_st,
                 hygiene: hygiene.clone(),
@@ -14435,44 +14495,54 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
         let mut h = blake3::Hasher::new();
         h.update(b"turbo-lean-replayed-olean-ilean-v1\n");
         let mut parsed_imps = None;
-        for (tag, p, required) in [
+        let mut fd_stats = [None; 4];
+        let mut fd_stable = true;
+        for (idx, (tag, p, required)) in [
             ("olean", olean_path, true),
             ("ilean", ilean_path.as_path(), false),
             ("srv", srv_path.as_path(), false),
             ("priv", priv_path.as_path(), false),
-        ] {
-            let present = match fs::metadata(p) {
-                Ok(meta) => {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match read_regular_file_bound_stat(p) {
+                Ok((fpre, bytes, fpost)) => {
                     anyhow::ensure!(
-                        meta.is_file() && (!required || meta.len() > 0),
+                        !required || !bytes.is_empty(),
                         "Replay-verified artifact `{}` is not a non-empty regular file",
                         p.display()
                     );
-                    true
+                    if fpre != fpost {
+                        fd_stable = false;
+                    }
+                    fd_stats[idx] = Some(fpost);
+                    h.update(&[1u8]);
+                    if tag == "olean" {
+                        parsed_imps = parse_olean_binary_imports(&bytes);
+                    }
+                    update_lp(&mut h, tag.as_bytes(), blake3::hash(&bytes).as_bytes());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => false,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => {
+                    h.update(&[0u8]);
+                    update_lp(&mut h, tag.as_bytes(), b"");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    anyhow::bail!(
+                        "Replay-verified artifact `{}` is not a non-empty regular file",
+                        p.display()
+                    );
+                }
                 Err(e) => {
                     return Err(e).with_context(|| {
-                        format!("Failed to stat replay-verified artifact `{}`", p.display())
+                        format!("Failed to read replay-verified artifact `{}`", p.display())
                     })
                 }
-            };
-            h.update(&[u8::from(present)]);
-            if present {
-                let bytes = fs::read(p).with_context(|| {
-                    format!("Failed to read replay-verified artifact `{}`", p.display())
-                })?;
-                if tag == "olean" {
-                    parsed_imps = parse_olean_binary_imports(&bytes);
-                }
-                update_lp(&mut h, tag.as_bytes(), blake3::hash(&bytes).as_bytes());
-            } else {
-                update_lp(&mut h, tag.as_bytes(), b"");
             }
         }
-        Ok((h.finalize().to_hex().to_string(), parsed_imps))
+        Ok((h.finalize().to_hex().to_string(), parsed_imps, fd_stats, fd_stable))
     };
-    let (res, parsed_imps) = match _flock_guard.as_ref() {
+    let (res, parsed_imps, fd_stats, fd_stable) = match _flock_guard.as_ref() {
         Some(g) => g.read_consistent(&paths, digest),
         None => digest(),
     }?;
@@ -14482,7 +14552,11 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
         path_olean_stat_sig(&srv_path),
         path_olean_stat_sig(&priv_path),
     ];
-    if post_stats == pre_stats && olean_stat_bundle_trusted_to_store(&post_stats, read_started_ns) {
+    if fd_stable
+        && fd_stats == pre_stats
+        && post_stats == pre_stats
+        && olean_stat_bundle_trusted_to_store(&post_stats, read_started_ns)
+    {
         if let Ok(mut g) = memo.lock() {
             if current_memo_window() == window {
                 if g.len() >= 65536 {
@@ -14560,7 +14634,7 @@ pub(crate) fn read_olean_binary_imports_cached(
         }
     }
     let read_started_ns = crate::zygote::wall_clock_ns();
-    let bytes = fs::read(olean_path).with_context(|| {
+    let (fd_pre, bytes, fd_post) = read_regular_file_bound_stat(olean_path).with_context(|| {
         format!(
             "Failed to read `.olean` `{}` for binary import header",
             olean_path.display()
@@ -14573,7 +14647,11 @@ pub(crate) fn read_olean_binary_imports_cached(
         )
     })?;
     if let Some(post_st) = path_olean_stat_sig(olean_path) {
-        if Some(post_st) == cur_stat && olean_stat_sig_trusted_at(&post_st, read_started_ns) {
+        if fd_pre == fd_post
+            && Some(fd_pre) == cur_stat
+            && post_st == fd_post
+            && olean_stat_sig_trusted_at(&post_st, read_started_ns)
+        {
             if let Ok(mut g) = memo.lock() {
                 if current_memo_window() == window {
                     if g.len() >= 65536 {
@@ -15854,7 +15932,7 @@ fn verify_and_hash_artifact_bytes(
         }
     }
     let read_started_ns = crate::zygote::wall_clock_ns();
-    let bytes = fs::read(artifact_path)?;
+    let (fd_pre, bytes, fd_post) = read_regular_file_bound_stat(artifact_path)?;
     if artifact_path.extension().and_then(|s| s.to_str()) == Some("olean")
         && (bytes.len() < 32 || !bytes.starts_with(b"olean"))
     {
@@ -15864,49 +15942,62 @@ fn verify_and_hash_artifact_bytes(
         );
     }
     let actual_h = lake_hash_bytes(&bytes);
+    let mut sidecar_fd_ok = true;
     if check_existing_sidecar {
-        if hash_path.exists() {
-            let raw = fs::read_to_string(&hash_path)?;
-            let trimmed = raw.trim();
-            if trimmed.len() != 16 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-                anyhow::bail!("Malformed 16-hex hash in sidecar `{}`", hash_path.display());
+        match read_regular_file_bound_stat(&hash_path) {
+            Ok((spre, sbytes, spost)) => {
+                sidecar_fd_ok = spre == spost && Some(spost) == sidecar_stat;
+                let raw = std::str::from_utf8(&sbytes).with_context(|| {
+                    format!("Non-UTF8 hash in sidecar `{}`", hash_path.display())
+                })?;
+                let trimmed = raw.trim();
+                if trimmed.len() != 16 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    anyhow::bail!("Malformed 16-hex hash in sidecar `{}`", hash_path.display());
+                }
+                let recorded_h = u64::from_str_radix(trimmed, 16)?;
+                if recorded_h != actual_h {
+                    anyhow::bail!(
+                        "Sidecar hash mismatch for `{}` (recorded {:016x} != actual {:016x})",
+                        artifact_path.display(),
+                        recorded_h,
+                        actual_h
+                    );
+                }
             }
-            let recorded_h = u64::from_str_radix(trimmed, 16)?;
-            if recorded_h != actual_h {
-                anyhow::bail!(
-                    "Sidecar hash mismatch for `{}` (recorded {:016x} != actual {:016x})",
-                    artifact_path.display(),
-                    recorded_h,
-                    actual_h
-                );
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if require_hash_file {
+                    anyhow::bail!(
+                        "Required dependency hash sidecar `{}` is missing",
+                        hash_path.display()
+                    );
+                }
             }
-        } else if require_hash_file {
-            anyhow::bail!(
-                "Required dependency hash sidecar `{}` is missing",
-                hash_path.display()
-            );
+            Err(e) => return Err(e.into()),
         }
     }
-    if let Some(post_ast) = path_olean_stat_sig(artifact_path) {
-        let post_sst = if check_existing_sidecar {
-            path_olean_stat_sig(&hash_path)
-        } else {
-            None
-        };
-        if Some(post_ast) == art_stat
-            && post_sst == sidecar_stat
-            && olean_stat_sig_trusted_at(&post_ast, read_started_ns)
-            && post_sst.is_none_or(|s| olean_stat_sig_trusted_at(&s, read_started_ns))
-        {
-            if let Ok(mut g) = memo.lock() {
-                if current_memo_window() == window {
-                    if g.len() >= 131_072 {
-                        g.clear();
+    if fd_pre == fd_post && sidecar_fd_ok {
+        if let Some(post_ast) = path_olean_stat_sig(artifact_path) {
+            let post_sst = if check_existing_sidecar {
+                path_olean_stat_sig(&hash_path)
+            } else {
+                None
+            };
+            if post_ast == fd_post
+                && Some(post_ast) == art_stat
+                && post_sst == sidecar_stat
+                && olean_stat_sig_trusted_at(&post_ast, read_started_ns)
+                && post_sst.is_none_or(|s| olean_stat_sig_trusted_at(&s, read_started_ns))
+            {
+                if let Ok(mut g) = memo.lock() {
+                    if current_memo_window() == window {
+                        if g.len() >= 131_072 {
+                            g.clear();
+                        }
+                        g.insert(
+                            artifact_path.to_path_buf(),
+                            (window, post_ast, post_sst, actual_h),
+                        );
                     }
-                    g.insert(
-                        artifact_path.to_path_buf(),
-                        (window, post_ast, post_sst, actual_h),
-                    );
                 }
             }
         }
@@ -19646,7 +19737,7 @@ fn record_verified_dep_source_cached(
     // Fingerprint only a stable dependency-package artifact set that still digests to the recorded
     // value; root `.turbo_verified_sources.json` stays purely content-addressed across CAS restores.
     let fp = (!node.is_root_pkg)
-        .then(|| olean_artifact_stat_fingerprint(&node.olean_path))
+        .then(|| olean_artifact_stat_fingerprint_for_store(&node.olean_path))
         .flatten();
     let artifact_stat_fingerprint = fp
         .filter(|fp| {
@@ -19655,7 +19746,7 @@ fn record_verified_dep_source_cached(
                 crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
             )
             .is_ok_and(|d| d == olean_artifact_digest)
-                && olean_artifact_stat_fingerprint(&node.olean_path).as_ref() == Some(fp)
+                && olean_artifact_stat_fingerprint_for_store(&node.olean_path).as_ref() == Some(fp)
         })
         .unwrap_or_default();
     let pkg_root = &node.pkg_root;
@@ -21279,7 +21370,9 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
                         let stat_fp = if spec.is_root_pkg {
                             String::new()
                         } else {
-                            fp_opt.unwrap_or_default()
+                            olean_artifact_stat_fingerprint_for_store(olean_path)
+                                .filter(|s| Some(s.as_str()) == fp_opt.as_deref())
+                                .unwrap_or_default()
                         };
                         Some((
                             spec.pkg_root.clone(),

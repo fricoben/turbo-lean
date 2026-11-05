@@ -915,7 +915,7 @@ static SINGLE_OLEAN_DIGEST_MEMO: std::sync::OnceLock<
             PathBuf,
             (
                 u64,
-                [crate::module_builder::FileStatFingerprint; 6],
+                [Option<crate::zygote::OleanFileStatSig>; 6],
                 [u8; 32],
                 String,
                 Vec<String>,
@@ -927,11 +927,11 @@ static SINGLE_OLEAN_DIGEST_MEMO: std::sync::OnceLock<
 #[allow(clippy::type_complexity)]
 struct InterfaceClosureMemoEntry {
     window: u64,
-    self_stats: std::sync::Arc<Vec<(PathBuf, crate::module_builder::FileStatFingerprint)>>,
+    self_stats: std::sync::Arc<Vec<(PathBuf, Option<crate::zygote::OleanFileStatSig>)>>,
     sample_check: Option<(
         PathBuf,
         [PathBuf; 5],
-        [crate::module_builder::FileStatFingerprint; 6],
+        [Option<crate::zygote::OleanFileStatSig>; 6],
         [u8; 32],
     )>,
     pkg_dir_presence: std::sync::Arc<Vec<(PathBuf, bool)>>,
@@ -946,7 +946,7 @@ static MODULE_INTERFACE_CLOSURE_MEMO: std::sync::OnceLock<
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ShmSingleOleanDigestEntry {
-    stats: [crate::module_builder::FileStatFingerprint; 6],
+    stats: [Option<crate::zygote::OleanFileStatSig>; 6],
     sample_key: [u8; 32],
     digest: String,
     deps: Vec<String>,
@@ -962,18 +962,19 @@ fn shm_single_olean_cache_file_name(olean_path: &Path) -> String {
 fn compute_olean_bundle_sample_key(
     olean_path: &Path,
     comp_paths: &[PathBuf; 5],
-    stats: &[crate::module_builder::FileStatFingerprint; 6],
+    stats: &[Option<crate::zygote::OleanFileStatSig>; 6],
 ) -> Option<[u8; 32]> {
     stats[0]?;
     let mut sample_hasher = blake3::Hasher::new();
     sample_hasher.update(b"olean-bundle-sample-v1\n");
-    let mut hash_one = |p: &Path, st: crate::module_builder::FileStatFingerprint| -> Option<()> {
+    let mut hash_one = |p: &Path, st: Option<crate::zygote::OleanFileStatSig>| -> Option<()> {
         match st {
             None => {
                 sample_hasher.update(&[0u8]);
                 Some(())
             }
-            Some((_, _, sz)) => {
+            Some(sig) => {
+                let sz = sig.size;
                 sample_hasher.update(&[1u8]);
                 sample_hasher.update(&sz.to_le_bytes());
                 let mut f = fs::File::open(p).ok()?;
@@ -1008,6 +1009,11 @@ pub(crate) fn clear_olean_interface_memo() {
             g.clear();
         }
     }
+    if let Some(m) = PROJECT_SOURCE_BLAKE3_MEMO.get() {
+        if let Ok(mut g) = m.lock() {
+            g.clear();
+        }
+    }
 }
 
 pub(crate) fn single_olean_companion_paths(olean_path: &Path) -> [PathBuf; 5] {
@@ -1023,64 +1029,73 @@ pub(crate) fn single_olean_companion_paths(olean_path: &Path) -> [PathBuf; 5] {
 pub(crate) fn single_olean_stat_bundle(
     olean_path: &Path,
     comp_paths: &[PathBuf; 5],
-) -> [crate::module_builder::FileStatFingerprint; 6] {
+) -> [Option<crate::zygote::OleanFileStatSig>; 6] {
     [
-        crate::module_builder::path_stat_fingerprint(olean_path),
-        crate::module_builder::path_stat_fingerprint(&comp_paths[0]),
-        crate::module_builder::path_stat_fingerprint(&comp_paths[1]),
-        crate::module_builder::path_stat_fingerprint(&comp_paths[2]),
-        crate::module_builder::path_stat_fingerprint(&comp_paths[3]),
-        crate::module_builder::path_stat_fingerprint(&comp_paths[4]),
+        crate::module_builder::path_olean_stat_sig(olean_path),
+        crate::module_builder::path_olean_stat_sig(&comp_paths[0]),
+        crate::module_builder::path_olean_stat_sig(&comp_paths[1]),
+        crate::module_builder::path_olean_stat_sig(&comp_paths[2]),
+        crate::module_builder::path_olean_stat_sig(&comp_paths[3]),
+        crate::module_builder::path_olean_stat_sig(&comp_paths[4]),
     ]
 }
 
 pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
     olean_path: &Path,
     comp_paths: &[PathBuf; 5],
-    cur_stats: [crate::module_builder::FileStatFingerprint; 6],
+    cur_stats: [Option<crate::zygote::OleanFileStatSig>; 6],
 ) -> Option<(String, Vec<String>, [u8; 32])> {
     let window = crate::module_builder::current_memo_window();
     cur_stats[0]?;
     let sample_key = compute_olean_bundle_sample_key(olean_path, comp_paths, &cur_stats)?;
     let memo = SINGLE_OLEAN_DIGEST_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Ok(g) = memo.lock() {
-        if let Some((w, cached_stats, cached_sample, dig, deps)) = g.get(olean_path) {
-            if *w == window && *cached_stats == cur_stats && *cached_sample == sample_key {
-                return Some((dig.clone(), deps.clone(), sample_key));
-            }
-        }
-    }
-    let use_shm = cur_stats[0].is_some_and(|(_, _, len)| len > 65536);
-    let shm_file_opt = use_shm.then(|| shm_single_olean_cache_file_name(olean_path));
-    if let Some(ref shm_file_name) = shm_file_opt {
-        if let Some(shm_bytes) =
-            crate::shm_cache::read_verified_private_shm_file("olean_iface_v1", shm_file_name)
-        {
-            if let Ok(entry) = serde_json::from_slice::<ShmSingleOleanDigestEntry>(&shm_bytes) {
-                if entry.stats == cur_stats && entry.sample_key == sample_key {
-                    if let Ok(mut g) = memo.lock() {
-                        if crate::module_builder::current_memo_window() == window {
-                            if g.len() >= 65536 {
-                                g.clear();
-                            }
-                            g.insert(
-                                olean_path.to_path_buf(),
-                                (
-                                    window,
-                                    cur_stats,
-                                    sample_key,
-                                    entry.digest.clone(),
-                                    entry.deps.clone(),
-                                ),
-                            );
-                        }
-                    }
-                    return Some((entry.digest, entry.deps, sample_key));
+    let can_reuse = crate::module_builder::olean_stat_bundle6_trusted_for_reuse(&cur_stats);
+    if can_reuse {
+        if let Ok(g) = memo.lock() {
+            if let Some((w, cached_stats, cached_sample, dig, deps)) = g.get(olean_path) {
+                if *w == window && *cached_stats == cur_stats && *cached_sample == sample_key {
+                    return Some((dig.clone(), deps.clone(), sample_key));
                 }
             }
         }
     }
-    let bytes = fs::read(olean_path).ok()?;
+    let use_shm = can_reuse && cur_stats[0].is_some_and(|s| s.size > 65536);
+    let shm_file_opt =
+        cur_stats[0].is_some_and(|s| s.size > 65536).then(|| shm_single_olean_cache_file_name(olean_path));
+    if use_shm {
+        if let Some(ref shm_file_name) = shm_file_opt {
+            if let Some(shm_bytes) =
+                crate::shm_cache::read_verified_private_shm_file("olean_iface_v2", shm_file_name)
+            {
+                if let Ok(entry) = serde_json::from_slice::<ShmSingleOleanDigestEntry>(&shm_bytes) {
+                    if entry.stats == cur_stats && entry.sample_key == sample_key {
+                        if let Ok(mut g) = memo.lock() {
+                            if crate::module_builder::current_memo_window() == window {
+                                if g.len() >= 65536 {
+                                    g.clear();
+                                }
+                                g.insert(
+                                    olean_path.to_path_buf(),
+                                    (
+                                        window,
+                                        cur_stats,
+                                        sample_key,
+                                        entry.digest.clone(),
+                                        entry.deps.clone(),
+                                    ),
+                                );
+                            }
+                        }
+                        return Some((entry.digest, entry.deps, sample_key));
+                    }
+                }
+            }
+        }
+    }
+    let read_started_ns = crate::zygote::wall_clock_ns();
+    let (pre0, bytes, post0) = crate::module_builder::read_regular_file_bound_stat(olean_path).ok()?;
+    let mut fd_stats = [Some(post0), None, None, None, None, None];
+    let mut fd_stable = pre0 == post0;
     let olean_deps = crate::module_builder::parse_olean_binary_imports(&bytes)
         .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>())
         .unwrap_or_default();
@@ -1088,16 +1103,18 @@ pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
     h.update(b"olean-full:v3:");
     h.update(blake3::hash(&bytes).as_bytes());
     let tags = ["srv", "priv", "ilean", "ir", "ir_sig"];
-    for (tag, comp_path) in tags.iter().zip(comp_paths.iter()) {
+    for (idx, (tag, comp_path)) in tags.iter().zip(comp_paths.iter()).enumerate() {
         h.update(b"|");
         h.update(tag.as_bytes());
-        match fs::metadata(comp_path) {
-            Ok(cm) if cm.is_file() => {
-                let comp_bytes = fs::read(comp_path).ok()?;
+        match crate::module_builder::read_regular_file_bound_stat(comp_path) {
+            Ok((cpre, comp_bytes, cpost)) => {
+                if cpre != cpost {
+                    fd_stable = false;
+                }
+                fd_stats[idx + 1] = Some(cpost);
                 h.update(&[1u8]);
                 h.update(blake3::hash(&comp_bytes).as_bytes());
             }
-            Ok(_) => return None,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 h.update(&[0u8]);
             }
@@ -1108,24 +1125,29 @@ pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
     let post_stats = single_olean_stat_bundle(olean_path, comp_paths);
     let post_sample_opt = compute_olean_bundle_sample_key(olean_path, comp_paths, &post_stats);
     if let Some(post_sample) = post_sample_opt {
-        if let Ok(mut g) = memo.lock() {
-            if crate::module_builder::current_memo_window() == window {
-                if g.len() >= 65536 {
-                    g.clear();
+        if fd_stable
+            && fd_stats == cur_stats
+            && post_stats == cur_stats
+            && post_sample == sample_key
+            && crate::module_builder::olean_stat_bundle6_trusted_to_store(&post_stats, read_started_ns)
+        {
+            if let Ok(mut g) = memo.lock() {
+                if crate::module_builder::current_memo_window() == window {
+                    if g.len() >= 65536 {
+                        g.clear();
+                    }
+                    g.insert(
+                        olean_path.to_path_buf(),
+                        (
+                            window,
+                            post_stats,
+                            post_sample,
+                            dig.clone(),
+                            olean_deps.clone(),
+                        ),
+                    );
                 }
-                g.insert(
-                    olean_path.to_path_buf(),
-                    (
-                        window,
-                        post_stats,
-                        post_sample,
-                        dig.clone(),
-                        olean_deps.clone(),
-                    ),
-                );
             }
-        }
-        if post_stats == cur_stats && post_sample == sample_key {
             if let Some(shm_file_name) = shm_file_opt {
                 let shm_entry = ShmSingleOleanDigestEntry {
                     stats: post_stats,
@@ -1135,7 +1157,7 @@ pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
                 };
                 if let Ok(shm_bytes) = serde_json::to_vec(&shm_entry) {
                     let _ = crate::shm_cache::write_verified_private_shm_file(
-                        "olean_iface_v1",
+                        "olean_iface_v2",
                         &shm_file_name,
                         &shm_bytes,
                     );
@@ -1148,28 +1170,16 @@ pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
 
 #[allow(clippy::type_complexity)]
 static PROJECT_SOURCE_BLAKE3_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(PathBuf, u64, i64, u64, [u8; 32]), String>>,
+    std::sync::Mutex<HashMap<(PathBuf, crate::zygote::OleanFileStatSig, [u8; 32]), (u64, String)>>,
 > = std::sync::OnceLock::new();
 
 pub(crate) fn compute_cached_source_blake3(path: &Path) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let file_len = meta.len();
-    if file_len <= 65536 {
-        let bytes = fs::read(path).ok()?;
+    let cur_sig = crate::module_builder::path_olean_stat_sig(path)?;
+    if cur_sig.size <= 65536 {
+        let (_, bytes, _) = crate::module_builder::read_regular_file_bound_stat(path).ok()?;
         return Some(blake3::hash(&bytes).to_hex().to_string());
     }
-    let (ms, mn, _) = TurboStore::extract_file_stat_tuple(&meta);
-    let mtime_ns = ms.saturating_mul(1_000_000_000).saturating_add(mn);
-    #[cfg(unix)]
-    let ino = {
-        use std::os::unix::fs::MetadataExt;
-        meta.ino()
-    };
-    #[cfg(not(unix))]
-    let ino = 0u64;
+    let window = crate::module_builder::current_memo_window();
     let mut sample_hasher = blake3::Hasher::new();
     if let Ok(mut f) = fs::File::open(path) {
         use std::io::{Read, Seek, SeekFrom};
@@ -1177,27 +1187,40 @@ pub(crate) fn compute_cached_source_blake3(path: &Path) -> Option<String> {
         if let Ok(n) = f.read(&mut buf) {
             sample_hasher.update(&buf[..n]);
         }
-        if file_len > 8192 && f.seek(SeekFrom::End(-4096)).is_ok() {
+        if cur_sig.size > 8192 && f.seek(SeekFrom::End(-4096)).is_ok() {
             if let Ok(n) = f.read(&mut buf) {
                 sample_hasher.update(&buf[..n]);
             }
         }
     }
     let sample_key = *sample_hasher.finalize().as_bytes();
-    let memo_key = (path.to_path_buf(), file_len, mtime_ns, ino, sample_key);
+    let memo_key = (path.to_path_buf(), cur_sig, sample_key);
     let cache = PROJECT_SOURCE_BLAKE3_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(hit) = guard.get(&memo_key) {
-            return Some(hit.clone());
+    if crate::zygote::dev_records_subsecond_timestamps(&cur_sig) {
+        if let Ok(guard) = cache.lock() {
+            if let Some((w, hit)) = guard.get(&memo_key) {
+                if *w == window {
+                    return Some(hit.clone());
+                }
+            }
         }
     }
-    let bytes = fs::read(path).ok()?;
+    let read_started_ns = crate::zygote::wall_clock_ns();
+    let (fd_pre, bytes, fd_post) = crate::module_builder::read_regular_file_bound_stat(path).ok()?;
     let hex = blake3::hash(&bytes).to_hex().to_string();
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() > 8192 {
-            guard.clear();
+    if fd_pre == fd_post
+        && fd_pre == cur_sig
+        && crate::module_builder::path_olean_stat_sig(path) == Some(fd_post)
+        && crate::module_builder::olean_stat_sig_trusted_at(&fd_post, read_started_ns)
+    {
+        if let Ok(mut guard) = cache.lock() {
+            if crate::module_builder::current_memo_window() == window {
+                if guard.len() > 8192 {
+                    guard.clear();
+                }
+                guard.insert(memo_key, (window, hex.clone()));
+            }
         }
-        guard.insert(memo_key, hex.clone());
     }
     Some(hex)
 }
@@ -1345,7 +1368,7 @@ fn resolve_olean_search_dirs_and_tc(
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub(crate) struct OleanInterfaceBatchSession {
-    stat_memo: HashMap<PathBuf, crate::module_builder::FileStatFingerprint>,
+    stat_memo: HashMap<PathBuf, Option<crate::zygote::OleanFileStatSig>>,
     valid_closures: HashSet<(PathBuf, String, String)>,
     project_env_memo:
         HashMap<(PathBuf, Option<String>), (Vec<PathBuf>, String, Option<(PathBuf, String)>)>,
@@ -1403,7 +1426,7 @@ impl OleanInterfaceBatchSession {
 fn closure_self_stats_valid(
     entry: &InterfaceClosureMemoEntry,
     window: u64,
-    stat_memo: &mut HashMap<PathBuf, crate::module_builder::FileStatFingerprint>,
+    stat_memo: &mut HashMap<PathBuf, Option<crate::zygote::OleanFileStatSig>>,
 ) -> bool {
     if entry.window != window {
         return false;
@@ -1411,8 +1434,9 @@ fn closure_self_stats_valid(
     entry.self_stats.iter().all(|(p, expected_st)| {
         let cur = *stat_memo
             .entry(p.clone())
-            .or_insert_with(|| crate::module_builder::path_stat_fingerprint(p));
+            .or_insert_with(|| crate::module_builder::path_olean_stat_sig(p));
         cur == *expected_st
+            && cur.is_none_or(|ref sig| crate::zygote::dev_records_subsecond_timestamps(sig))
     }) && entry
         .pkg_dir_presence
         .iter()
@@ -1421,8 +1445,9 @@ fn closure_self_stats_valid(
             .sample_check
             .as_ref()
             .is_none_or(|(cand, comp_paths, stats, expected_sample)| {
-                compute_olean_bundle_sample_key(cand, comp_paths, stats).as_ref()
-                    == Some(expected_sample)
+                crate::module_builder::olean_stat_bundle6_trusted_for_reuse(stats)
+                    && compute_olean_bundle_sample_key(cand, comp_paths, stats).as_ref()
+                        == Some(expected_sample)
             })
 }
 
@@ -1434,7 +1459,7 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
     search_key: &str,
     resolved_tc: &Option<(PathBuf, String)>,
     lake_inputs_tag: Option<String>,
-    stat_memo: &mut HashMap<PathBuf, crate::module_builder::FileStatFingerprint>,
+    stat_memo: &mut HashMap<PathBuf, Option<crate::zygote::OleanFileStatSig>>,
     valid_closures: &mut HashSet<(PathBuf, String, String)>,
 ) -> Vec<String> {
     let mut worklist = parse_header_imports(src);
@@ -1451,12 +1476,12 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
         MODULE_INTERFACE_CLOSURE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
 
     let stat_of = |p: &Path,
-                   sm: &mut HashMap<PathBuf, crate::module_builder::FileStatFingerprint>|
-     -> crate::module_builder::FileStatFingerprint {
+                   sm: &mut HashMap<PathBuf, Option<crate::zygote::OleanFileStatSig>>|
+     -> Option<crate::zygote::OleanFileStatSig> {
         if let Some(&st) = sm.get(p) {
             st
         } else {
-            let st = crate::module_builder::path_stat_fingerprint(p);
+            let st = crate::module_builder::path_olean_stat_sig(p);
             sm.insert(p.to_path_buf(), st);
             st
         }
@@ -1475,10 +1500,10 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
         String,
         PathBuf,
         [PathBuf; 5],
-        [crate::module_builder::FileStatFingerprint; 6],
+        [Option<crate::zygote::OleanFileStatSig>; 6],
         Option<PathBuf>,
         Option<String>,
-        Vec<(PathBuf, crate::module_builder::FileStatFingerprint)>,
+        Vec<(PathBuf, Option<crate::zygote::OleanFileStatSig>)>,
         Vec<(PathBuf, bool)>,
     )> = Vec::new();
 
@@ -1521,7 +1546,7 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
 
             let rel_slash = crate::module_builder::module_name_to_rel_slash(&cur_mod);
             let rel_olean = format!("{}.olean", rel_slash);
-            let mut self_stats: Vec<(PathBuf, crate::module_builder::FileStatFingerprint)> =
+            let mut self_stats: Vec<(PathBuf, Option<crate::zygote::OleanFileStatSig>)> =
                 Vec::new();
             let sub_lean_opt = resolve_project_lean_source(project_dir, &rel_slash);
             if let Some(ref lp) = sub_lean_opt {
@@ -1557,7 +1582,7 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
             let mut matched_olean: Option<(
                 PathBuf,
                 [PathBuf; 5],
-                [crate::module_builder::FileStatFingerprint; 6],
+                [Option<crate::zygote::OleanFileStatSig>; 6],
             )> = None;
             if let Some(dir) = owner_root {
                 let cand = dir.join(&rel_olean);
@@ -1587,7 +1612,9 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
             }
 
             if let Some((cand, comp_paths, cur_stats)) = matched_olean {
-                let sample_opt = compute_olean_bundle_sample_key(&cand, &comp_paths, &cur_stats);
+                let sample_opt = crate::module_builder::olean_stat_bundle6_trusted_for_reuse(&cur_stats)
+                    .then(|| compute_olean_bundle_sample_key(&cand, &comp_paths, &cur_stats))
+                    .flatten();
                 let fast_hit = sample_opt.and_then(|sample_key| {
                     let memo = SINGLE_OLEAN_DIGEST_MEMO
                         .get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -1632,22 +1659,34 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
                             stack.push(ch.clone());
                         }
                     }
-                    let entry = InterfaceClosureMemoEntry {
-                        window,
-                        self_stats: std::sync::Arc::new(self_stats),
-                        sample_check: Some((cand, comp_paths, cur_stats, sample_key)),
-                        pkg_dir_presence: std::sync::Arc::new(pkg_dir_presence),
-                        self_entries: std::sync::Arc::new(self_entries),
-                        children: std::sync::Arc::new(children),
-                    };
-                    if let Ok(mut g) = closure_memo.lock() {
-                        if crate::module_builder::current_memo_window() == window {
-                            if g.len() >= 32768 {
-                                g.clear();
-                                valid_closures.clear();
+                    let fast_closure_started_ns = crate::zygote::wall_clock_ns();
+                    if self_stats
+                        .iter()
+                        .filter_map(|(_, st)| st.as_ref())
+                        .all(|sig| {
+                            crate::module_builder::olean_stat_sig_trusted_at(
+                                sig,
+                                fast_closure_started_ns,
+                            )
+                        })
+                    {
+                        let entry = InterfaceClosureMemoEntry {
+                            window,
+                            self_stats: std::sync::Arc::new(self_stats),
+                            sample_check: Some((cand, comp_paths, cur_stats, sample_key)),
+                            pkg_dir_presence: std::sync::Arc::new(pkg_dir_presence),
+                            self_entries: std::sync::Arc::new(self_entries),
+                            children: std::sync::Arc::new(children),
+                        };
+                        if let Ok(mut g) = closure_memo.lock() {
+                            if crate::module_builder::current_memo_window() == window {
+                                if g.len() >= 32768 {
+                                    g.clear();
+                                    valid_closures.clear();
+                                }
+                                g.insert(cur_key.clone(), entry);
+                                valid_closures.insert(cur_key);
                             }
-                            g.insert(cur_key.clone(), entry);
-                            valid_closures.insert(cur_key);
                         }
                     }
                 } else {
@@ -1824,23 +1863,30 @@ fn compute_imported_olean_interface_hashes_with_precomputed_env(
                     stack.push(ch.clone());
                 }
             }
-            let cur_key = (project_dir.to_path_buf(), search_key.to_string(), cur_mod);
-            let entry = InterfaceClosureMemoEntry {
-                window,
-                self_stats: std::sync::Arc::new(self_stats),
-                sample_check,
-                pkg_dir_presence: std::sync::Arc::new(pkg_dir_presence),
-                self_entries: std::sync::Arc::new(self_entries),
-                children: std::sync::Arc::new(children),
-            };
-            if let Ok(mut g) = closure_memo.lock() {
-                if crate::module_builder::current_memo_window() == window {
-                    if g.len() >= 32768 {
-                        g.clear();
-                        valid_closures.clear();
+            let closure_started_ns = crate::zygote::wall_clock_ns();
+            let closure_trusted_to_store = self_stats
+                .iter()
+                .filter_map(|(_, st)| st.as_ref())
+                .all(|sig| crate::module_builder::olean_stat_sig_trusted_at(sig, closure_started_ns));
+            if closure_trusted_to_store {
+                let cur_key = (project_dir.to_path_buf(), search_key.to_string(), cur_mod);
+                let entry = InterfaceClosureMemoEntry {
+                    window,
+                    self_stats: std::sync::Arc::new(self_stats),
+                    sample_check,
+                    pkg_dir_presence: std::sync::Arc::new(pkg_dir_presence),
+                    self_entries: std::sync::Arc::new(self_entries),
+                    children: std::sync::Arc::new(children),
+                };
+                if let Ok(mut g) = closure_memo.lock() {
+                    if crate::module_builder::current_memo_window() == window {
+                        if g.len() >= 32768 {
+                            g.clear();
+                            valid_closures.clear();
+                        }
+                        g.insert(cur_key.clone(), entry);
+                        valid_closures.insert(cur_key);
                     }
-                    g.insert(cur_key.clone(), entry);
-                    valid_closures.insert(cur_key);
                 }
             }
         }
