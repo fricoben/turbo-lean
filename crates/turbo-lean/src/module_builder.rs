@@ -21248,8 +21248,7 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
         let prev_kernel_audited = existing_manifests
             .get(&pkg_root)
             .filter(|m| {
-                m.allowed_axioms == allowed_axioms
-                    && m.kernel_policy_digest == kernel_policy_digest
+                m.allowed_axioms == allowed_axioms && m.kernel_policy_digest == kernel_policy_digest
             })
             .and_then(|m| m.modules.get(&rel_src))
             .is_some_and(|e| {

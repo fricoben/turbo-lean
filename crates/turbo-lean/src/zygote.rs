@@ -371,15 +371,7 @@ impl OneShotGuard {
             std::process::id(),
             next_tmp_id()
         ));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(&dir)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(&dir)?;
+        crate::shm_cache::ensure_private_dir_all(&dir)?;
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &dir);
         let _ = ONE_SHOT_DIR.set((dir, base));
         // `eval` also exits with explicit status codes, bypassing Rust Drop.

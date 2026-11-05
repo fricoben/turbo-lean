@@ -7479,6 +7479,11 @@ fn kernel_statement_changes_with_trust(
         } else {
             trusted_statement_build(&head_project, head_snapshot.is_some())?;
         }
+        let snapshot_cfg = if head_snapshot.is_some() {
+            None
+        } else {
+            trusted_cfg.as_ref()
+        };
         certify_head_statement_modules_and_replay(
             store,
             &head_project,
@@ -7486,9 +7491,15 @@ fn kernel_statement_changes_with_trust(
             &policy,
             is_untrusted,
             None,
-            trusted_cfg.as_ref(),
+            snapshot_cfg,
         )?;
-        let head_cache_key = trusted_cfg.as_ref().and_then(|cfg| {
+        let snapshot_resolved_cfg = if head_snapshot.is_some() && !is_untrusted {
+            crate::module_builder::resolve_project_config_with_trust(&head_project, false).ok()
+        } else {
+            None
+        };
+        let eff_cfg = snapshot_resolved_cfg.as_ref().or(snapshot_cfg);
+        let head_cache_key = eff_cfg.and_then(|cfg| {
             head_statement_report_cache_action_key(&head_project, statement_scope, cfg, None)
         });
         if let Some(cached) = head_cache_key
@@ -7505,7 +7516,7 @@ fn kernel_statement_changes_with_trust(
                 Some(&store.root),
                 None,
             )?;
-            if let (Some(ref key), Some(ref cfg)) = (&head_cache_key, &trusted_cfg) {
+            if let (Some(ref key), Some(cfg)) = (&head_cache_key, eff_cfg) {
                 write_cached_json_blob(
                     &store.root,
                     key,

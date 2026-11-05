@@ -177,23 +177,58 @@ impl Drop for FlockGuard {
 
 /// Acquire an advisory `flock` (`exclusive` => `LOCK_EX`, else `LOCK_SH`; `nonblocking` => `| LOCK_NB`).
 /// Returns `Ok(None)` when `nonblocking` is true and another holder currently owns a conflicting lock.
+pub(crate) fn ensure_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if let Ok(sym) = fs::symlink_metadata(dir) {
+            if sym.file_type().is_symlink() || !sym.file_type().is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "staging directory is not a plain directory: {}",
+                        dir.display()
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        match builder.create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let sym = fs::symlink_metadata(dir)?;
+        if sym.file_type().is_symlink() || !sym.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "staging directory is not a plain directory: {}",
+                    dir.display()
+                ),
+            ));
+        }
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
 pub fn acquire_flock(
     lock_path: &Path,
     exclusive: bool,
     nonblocking: bool,
 ) -> std::io::Result<Option<FlockGuard>> {
     if let Some(parent) = lock_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                let mut builder = fs::DirBuilder::new();
-                builder.recursive(true).mode(0o700);
-                builder.create(parent)?;
-            }
-            #[cfg(not(unix))]
-            fs::create_dir_all(parent)?;
-        }
+        ensure_private_dir_all(parent)?;
     }
     let mut opts = fs::OpenOptions::new();
     opts.create(true).read(true).write(true).truncate(false);
@@ -548,17 +583,7 @@ fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
 
 fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.as_os_str().is_empty() && !parent.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(parent)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(parent)?;
-    }
+    ensure_private_dir_all(parent)?;
     let file_name = target
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -1063,17 +1088,7 @@ thread_local! {
 fn acquire_staging_lease(lock_path: &Path) -> std::io::Result<Option<FlockGuard>> {
     for attempt in 0..4096u32 {
         if let Some(parent) = lock_path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    let mut builder = fs::DirBuilder::new();
-                    builder.recursive(true).mode(0o700);
-                    builder.create(parent)?;
-                }
-                #[cfg(not(unix))]
-                fs::create_dir_all(parent)?;
-            }
+            ensure_private_dir_all(parent)?;
         }
         let mut opts = fs::OpenOptions::new();
         opts.create(true).read(true).write(true).truncate(false);
@@ -2413,8 +2428,10 @@ mod tests {
                     (&om_path, &forged_om_bytes),
                     (&oi_path, &forged_oi_bytes),
                 ] {
-                    let ext_hl =
-                        root.join(format!("ext_hl_{}", p.file_name().unwrap().to_string_lossy()));
+                    let ext_hl = root.join(format!(
+                        "ext_hl_{}",
+                        p.file_name().unwrap().to_string_lossy()
+                    ));
                     fs::write(&ext_hl, payload)?;
                     fs::set_permissions(&ext_hl, fs::Permissions::from_mode(0o600))?;
                     let _ = fs::remove_file(p);
@@ -2434,8 +2451,10 @@ mod tests {
                     (&om_path, &forged_om_bytes),
                     (&oi_path, &forged_oi_bytes),
                 ] {
-                    let ext_hl =
-                        root.join(format!("ext_hl_{}", p.file_name().unwrap().to_string_lossy()));
+                    let ext_hl = root.join(format!(
+                        "ext_hl_{}",
+                        p.file_name().unwrap().to_string_lossy()
+                    ));
                     assert_eq!(
                         fs::read(&ext_hl)?,
                         *payload,
