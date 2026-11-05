@@ -13511,15 +13511,15 @@ pub(crate) fn compute_olean_artifact_set_digest_parallel_safe(
     let window = current_memo_window();
     let art_paths = olean_artifact_paths(olean_path);
     let cur_stats = [
-        path_stat_fingerprint(&art_paths[0].1),
-        path_stat_fingerprint(&art_paths[1].1),
-        path_stat_fingerprint(&art_paths[2].1),
-        path_stat_fingerprint(&art_paths[3].1),
-        path_stat_fingerprint(&art_paths[4].1),
-        path_stat_fingerprint(&art_paths[5].1),
+        path_olean_stat_sig(&art_paths[0].1),
+        path_olean_stat_sig(&art_paths[1].1),
+        path_olean_stat_sig(&art_paths[2].1),
+        path_olean_stat_sig(&art_paths[3].1),
+        path_olean_stat_sig(&art_paths[4].1),
+        path_olean_stat_sig(&art_paths[5].1),
     ];
     let memo = OLEAN_ARTIFACT_SET_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if cur_stats[0].is_some_and(|(_, _, sz)| sz > 0) {
+    if olean_stat_bundle6_trusted_for_reuse(&cur_stats) {
         if let Ok(g) = memo.lock() {
             if let Some((w, cached_stats, hit)) = g.get(olean_path) {
                 if *w == window && *cached_stats == cur_stats {
@@ -13537,16 +13537,26 @@ pub(crate) fn compute_olean_artifact_set_digest_parallel_safe(
     } else {
         None
     };
+    let pre_stats = [
+        path_olean_stat_sig(&art_paths[0].1),
+        path_olean_stat_sig(&art_paths[1].1),
+        path_olean_stat_sig(&art_paths[2].1),
+        path_olean_stat_sig(&art_paths[3].1),
+        path_olean_stat_sig(&art_paths[4].1),
+        path_olean_stat_sig(&art_paths[5].1),
+    ];
+    let read_started_ns = crate::zygote::wall_clock_ns();
     let res = compute_olean_artifact_set_digest_locked(olean_path, _flock_guard.as_ref())?;
     let post_stats = [
-        path_stat_fingerprint(&art_paths[0].1),
-        path_stat_fingerprint(&art_paths[1].1),
-        path_stat_fingerprint(&art_paths[2].1),
-        path_stat_fingerprint(&art_paths[3].1),
-        path_stat_fingerprint(&art_paths[4].1),
-        path_stat_fingerprint(&art_paths[5].1),
+        path_olean_stat_sig(&art_paths[0].1),
+        path_olean_stat_sig(&art_paths[1].1),
+        path_olean_stat_sig(&art_paths[2].1),
+        path_olean_stat_sig(&art_paths[3].1),
+        path_olean_stat_sig(&art_paths[4].1),
+        path_olean_stat_sig(&art_paths[5].1),
     ];
-    if post_stats[0].is_some_and(|(_, _, sz)| sz > 0) {
+    if post_stats == pre_stats && olean_stat_bundle6_trusted_to_store(&post_stats, read_started_ns)
+    {
         if let Ok(mut g) = memo.lock() {
             if current_memo_window() == window {
                 if g.len() >= 65536 {
@@ -13566,15 +13576,15 @@ pub(crate) fn compute_olean_artifact_set_digest_with_policy(
     let window = current_memo_window();
     let art_paths = olean_artifact_paths(olean_path);
     let cur_stats = [
-        path_stat_fingerprint(&art_paths[0].1),
-        path_stat_fingerprint(&art_paths[1].1),
-        path_stat_fingerprint(&art_paths[2].1),
-        path_stat_fingerprint(&art_paths[3].1),
-        path_stat_fingerprint(&art_paths[4].1),
-        path_stat_fingerprint(&art_paths[5].1),
+        path_olean_stat_sig(&art_paths[0].1),
+        path_olean_stat_sig(&art_paths[1].1),
+        path_olean_stat_sig(&art_paths[2].1),
+        path_olean_stat_sig(&art_paths[3].1),
+        path_olean_stat_sig(&art_paths[4].1),
+        path_olean_stat_sig(&art_paths[5].1),
     ];
     let memo = OLEAN_ARTIFACT_SET_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if cur_stats[0].is_some_and(|(_, _, sz)| sz > 0) {
+    if olean_stat_bundle6_trusted_for_reuse(&cur_stats) {
         if let Ok(g) = memo.lock() {
             if let Some((w, cached_stats, hit)) = g.get(olean_path) {
                 if *w == window && *cached_stats == cur_stats {
@@ -13596,16 +13606,26 @@ pub(crate) fn compute_olean_artifact_set_digest_with_policy(
     } else {
         None
     };
+    let pre_stats = [
+        path_olean_stat_sig(&art_paths[0].1),
+        path_olean_stat_sig(&art_paths[1].1),
+        path_olean_stat_sig(&art_paths[2].1),
+        path_olean_stat_sig(&art_paths[3].1),
+        path_olean_stat_sig(&art_paths[4].1),
+        path_olean_stat_sig(&art_paths[5].1),
+    ];
+    let read_started_ns = crate::zygote::wall_clock_ns();
     let res = compute_olean_artifact_set_digest_locked(olean_path, _flock_guard.as_ref())?;
     let post_stats = [
-        path_stat_fingerprint(&art_paths[0].1),
-        path_stat_fingerprint(&art_paths[1].1),
-        path_stat_fingerprint(&art_paths[2].1),
-        path_stat_fingerprint(&art_paths[3].1),
-        path_stat_fingerprint(&art_paths[4].1),
-        path_stat_fingerprint(&art_paths[5].1),
+        path_olean_stat_sig(&art_paths[0].1),
+        path_olean_stat_sig(&art_paths[1].1),
+        path_olean_stat_sig(&art_paths[2].1),
+        path_olean_stat_sig(&art_paths[3].1),
+        path_olean_stat_sig(&art_paths[4].1),
+        path_olean_stat_sig(&art_paths[5].1),
     ];
-    if post_stats[0].is_some_and(|(_, _, sz)| sz > 0) {
+    if post_stats == pre_stats && olean_stat_bundle6_trusted_to_store(&post_stats, read_started_ns)
+    {
         if let Ok(mut g) = memo.lock() {
             if current_memo_window() == window {
                 if g.len() >= 65536 {
@@ -13960,14 +13980,79 @@ pub(crate) fn path_stat_fingerprint(path: &Path) -> FileStatFingerprint {
     Some(TurboStore::extract_file_stat_tuple(&meta))
 }
 
+#[inline]
+fn path_olean_stat_sig(path: &Path) -> Option<crate::zygote::OleanFileStatSig> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(crate::zygote::OleanFileStatSig::from_meta(&meta))
+}
+
+#[inline]
+fn olean_stat_sig_trusted_at(
+    sig: &crate::zygote::OleanFileStatSig,
+    read_started_ns: i128,
+) -> bool {
+    crate::zygote::dev_records_subsecond_timestamps(sig)
+        && read_started_ns > 0
+        && sig.ctime_ns() < read_started_ns - crate::zygote::STAT_TRUST_WINDOW_NS
+}
+
+#[inline]
+fn olean_stat_bundle_trusted_for_reuse(
+    sigs: &[Option<crate::zygote::OleanFileStatSig>; 4],
+) -> bool {
+    sigs[0].is_some_and(|s| s.size > 0)
+        && sigs
+            .iter()
+            .flatten()
+            .all(crate::zygote::dev_records_subsecond_timestamps)
+}
+
+#[inline]
+fn olean_stat_bundle_trusted_to_store(
+    sigs: &[Option<crate::zygote::OleanFileStatSig>; 4],
+    read_started_ns: i128,
+) -> bool {
+    sigs[0].is_some_and(|s| s.size > 0)
+        && sigs
+            .iter()
+            .flatten()
+            .all(|s| olean_stat_sig_trusted_at(s, read_started_ns))
+}
+
+#[inline]
+fn olean_stat_bundle6_trusted_for_reuse(
+    sigs: &[Option<crate::zygote::OleanFileStatSig>; 6],
+) -> bool {
+    sigs[0].is_some_and(|s| s.size > 0)
+        && sigs
+            .iter()
+            .flatten()
+            .all(crate::zygote::dev_records_subsecond_timestamps)
+}
+
+#[inline]
+fn olean_stat_bundle6_trusted_to_store(
+    sigs: &[Option<crate::zygote::OleanFileStatSig>; 6],
+    read_started_ns: i128,
+) -> bool {
+    sigs[0].is_some_and(|s| s.size > 0)
+        && sigs
+            .iter()
+            .flatten()
+            .all(|s| olean_stat_sig_trusted_at(s, read_started_ns))
+}
+
 #[allow(clippy::type_complexity)]
 static REPLAYED_OLEAN_DIGEST_MEMO: OnceLock<
-    Mutex<HashMap<PathBuf, (u64, [FileStatFingerprint; 4], String)>>,
+    Mutex<HashMap<PathBuf, (u64, [Option<crate::zygote::OleanFileStatSig>; 4], String)>>,
 > = OnceLock::new();
 
 #[allow(clippy::type_complexity)]
 static OLEAN_BINARY_IMPORTS_MEMO: OnceLock<
-    Mutex<HashMap<PathBuf, (u64, (i64, i64, i64), Vec<ParsedImport>, bool)>>,
+    Mutex<HashMap<PathBuf, (u64, crate::zygote::OleanFileStatSig, Vec<ParsedImport>, bool)>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -14004,12 +14089,22 @@ static OLEAN_IMPORT_CLOSURE_MEMO: OnceLock<
 
 #[allow(clippy::type_complexity)]
 static ARTIFACT_LAKE_HASH_MEMO: OnceLock<
-    Mutex<HashMap<PathBuf, (u64, (i64, i64, i64), Option<(i64, i64, i64)>, u64)>>,
+    Mutex<
+        HashMap<
+            PathBuf,
+            (
+                u64,
+                crate::zygote::OleanFileStatSig,
+                Option<crate::zygote::OleanFileStatSig>,
+                u64,
+            ),
+        >,
+    >,
 > = OnceLock::new();
 
 #[allow(clippy::type_complexity)]
 static OLEAN_ARTIFACT_SET_MEMO: OnceLock<
-    Mutex<HashMap<PathBuf, (u64, [FileStatFingerprint; 6], String)>>,
+    Mutex<HashMap<PathBuf, (u64, [Option<crate::zygote::OleanFileStatSig>; 6], String)>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -14195,7 +14290,7 @@ fn lake_needs_trace_entries(cfg: &ProjectConfig, node: &ModuleNode) -> Vec<serde
 #[allow(clippy::type_complexity)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ShmReplayedOleanDigestEntry {
-    stats: [FileStatFingerprint; 4],
+    stats: [Option<crate::zygote::OleanFileStatSig>; 4],
     digest: String,
     #[serde(default)]
     imports: Option<(Vec<ParsedImport>, bool)>,
@@ -14210,23 +14305,25 @@ fn shm_replayed_olean_cache_file_name(olean_path: &Path) -> String {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ShmSourceHygieneEntry {
-    stat: FileStatFingerprint,
+    stat: crate::zygote::OleanFileStatSig,
     hygiene: splitter::HygieneReport,
 }
 
 pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::HygieneReport> {
-    let cur_stat = path_stat_fingerprint(src_path);
-    let cache_file_name = if cur_stat.is_some() {
+    let cur_stat = path_olean_stat_sig(src_path);
+    let cache_file_name = if let Some(st) = cur_stat {
         let key = blake3::hash(src_path.to_string_lossy().as_bytes())
             .to_hex()
             .to_string();
         let file_name = format!("sh_{}.json", &key[..28]);
-        if let Some(bytes) =
-            crate::shm_cache::read_verified_private_shm_file("src_hygiene_v1", &file_name)
-        {
-            if let Ok(entry) = serde_json::from_slice::<ShmSourceHygieneEntry>(&bytes) {
-                if entry.stat == cur_stat {
-                    return Ok(entry.hygiene);
+        if crate::zygote::dev_records_subsecond_timestamps(&st) {
+            if let Some(bytes) =
+                crate::shm_cache::read_verified_private_shm_file("src_hygiene_v2", &file_name)
+            {
+                if let Ok(entry) = serde_json::from_slice::<ShmSourceHygieneEntry>(&bytes) {
+                    if entry.stat == st {
+                        return Ok(entry.hygiene);
+                    }
                 }
             }
         }
@@ -14234,17 +14331,18 @@ pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::Hy
     } else {
         None
     };
+    let read_started_ns = crate::zygote::wall_clock_ns();
     let src = fs::read_to_string(src_path)?;
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src));
-    if let (Some(file_name), Some(post_st)) = (cache_file_name, path_stat_fingerprint(src_path)) {
-        if Some(post_st) == cur_stat {
+    if let (Some(file_name), Some(post_st)) = (cache_file_name, path_olean_stat_sig(src_path)) {
+        if Some(post_st) == cur_stat && olean_stat_sig_trusted_at(&post_st, read_started_ns) {
             let entry = ShmSourceHygieneEntry {
-                stat: Some(post_st),
+                stat: post_st,
                 hygiene: hygiene.clone(),
             };
             if let Ok(bytes) = serde_json::to_vec(&entry) {
                 let _ = crate::shm_cache::write_verified_private_shm_file(
-                    "src_hygiene_v1",
+                    "src_hygiene_v2",
                     &file_name,
                     &bytes,
                 );
@@ -14266,13 +14364,13 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
     let srv_path = olean_path.with_extension("olean.server");
     let priv_path = olean_path.with_extension("olean.private");
     let cur_stats = [
-        path_stat_fingerprint(olean_path),
-        path_stat_fingerprint(&ilean_path),
-        path_stat_fingerprint(&srv_path),
-        path_stat_fingerprint(&priv_path),
+        path_olean_stat_sig(olean_path),
+        path_olean_stat_sig(&ilean_path),
+        path_olean_stat_sig(&srv_path),
+        path_olean_stat_sig(&priv_path),
     ];
     let memo = REPLAYED_OLEAN_DIGEST_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if cur_stats[0].is_some_and(|(_, _, sz)| sz > 0) {
+    if olean_stat_bundle_trusted_for_reuse(&cur_stats) {
         if let Ok(g) = memo.lock() {
             if let Some((w, cached_stats, hit)) = g.get(olean_path) {
                 if *w == window && *cached_stats == cur_stats {
@@ -14282,7 +14380,7 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
         }
         let shm_file_name = shm_replayed_olean_cache_file_name(olean_path);
         if let Some(bytes) =
-            crate::shm_cache::read_verified_private_shm_file("olean_meta_v1", &shm_file_name)
+            crate::shm_cache::read_verified_private_shm_file("olean_meta_v2", &shm_file_name)
         {
             if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
                 if entry.stats == cur_stats && !entry.digest.is_empty() {
@@ -14320,6 +14418,13 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
     } else {
         None
     };
+    let pre_stats = [
+        path_olean_stat_sig(olean_path),
+        path_olean_stat_sig(&ilean_path),
+        path_olean_stat_sig(&srv_path),
+        path_olean_stat_sig(&priv_path),
+    ];
+    let read_started_ns = crate::zygote::wall_clock_ns();
     let paths = vec![
         olean_path.to_path_buf(),
         ilean_path.clone(),
@@ -14372,12 +14477,12 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
         None => digest(),
     }?;
     let post_stats = [
-        path_stat_fingerprint(olean_path),
-        path_stat_fingerprint(&ilean_path),
-        path_stat_fingerprint(&srv_path),
-        path_stat_fingerprint(&priv_path),
+        path_olean_stat_sig(olean_path),
+        path_olean_stat_sig(&ilean_path),
+        path_olean_stat_sig(&srv_path),
+        path_olean_stat_sig(&priv_path),
     ];
-    if post_stats[0].is_some_and(|(_, _, sz)| sz > 0) {
+    if post_stats == pre_stats && olean_stat_bundle_trusted_to_store(&post_stats, read_started_ns) {
         if let Ok(mut g) = memo.lock() {
             if current_memo_window() == window {
                 if g.len() >= 65536 {
@@ -14405,7 +14510,7 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
         };
         if let Ok(bytes) = serde_json::to_vec(&shm_entry) {
             let _ = crate::shm_cache::write_verified_private_shm_file(
-                "olean_meta_v1",
+                "olean_meta_v2",
                 &shm_file_name,
                 &bytes,
             );
@@ -14418,40 +14523,43 @@ pub(crate) fn read_olean_binary_imports_cached(
     olean_path: &Path,
 ) -> Result<(Vec<ParsedImport>, bool)> {
     let window = current_memo_window();
-    let cur_stat = path_stat_fingerprint(olean_path);
+    let cur_stat = path_olean_stat_sig(olean_path);
     let memo = OLEAN_BINARY_IMPORTS_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(st) = cur_stat {
-        if let Ok(g) = memo.lock() {
-            if let Some((w, cached_st, imps, is_mod)) = g.get(olean_path) {
-                if *w == window && *cached_st == st {
-                    return Ok((imps.clone(), *is_mod));
+        if crate::zygote::dev_records_subsecond_timestamps(&st) {
+            if let Ok(g) = memo.lock() {
+                if let Some((w, cached_st, imps, is_mod)) = g.get(olean_path) {
+                    if *w == window && *cached_st == st {
+                        return Ok((imps.clone(), *is_mod));
+                    }
                 }
             }
-        }
-        let shm_file_name = shm_replayed_olean_cache_file_name(olean_path);
-        if let Some(bytes) =
-            crate::shm_cache::read_verified_private_shm_file("olean_meta_v1", &shm_file_name)
-        {
-            if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
-                if entry.stats[0] == Some(st) {
-                    if let Some((imps, is_mod)) = entry.imports {
-                        if let Ok(mut g) = memo.lock() {
-                            if current_memo_window() == window {
-                                if g.len() >= 65536 {
-                                    g.clear();
+            let shm_file_name = shm_replayed_olean_cache_file_name(olean_path);
+            if let Some(bytes) =
+                crate::shm_cache::read_verified_private_shm_file("olean_meta_v2", &shm_file_name)
+            {
+                if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
+                    if entry.stats[0] == Some(st) {
+                        if let Some((imps, is_mod)) = entry.imports {
+                            if let Ok(mut g) = memo.lock() {
+                                if current_memo_window() == window {
+                                    if g.len() >= 65536 {
+                                        g.clear();
+                                    }
+                                    g.insert(
+                                        olean_path.to_path_buf(),
+                                        (window, st, imps.clone(), is_mod),
+                                    );
                                 }
-                                g.insert(
-                                    olean_path.to_path_buf(),
-                                    (window, st, imps.clone(), is_mod),
-                                );
                             }
+                            return Ok((imps, is_mod));
                         }
-                        return Ok((imps, is_mod));
                     }
                 }
             }
         }
     }
+    let read_started_ns = crate::zygote::wall_clock_ns();
     let bytes = fs::read(olean_path).with_context(|| {
         format!(
             "Failed to read `.olean` `{}` for binary import header",
@@ -14464,16 +14572,18 @@ pub(crate) fn read_olean_binary_imports_cached(
             olean_path.display()
         )
     })?;
-    if let Some(post_st) = path_stat_fingerprint(olean_path) {
-        if let Ok(mut g) = memo.lock() {
-            if current_memo_window() == window {
-                if g.len() >= 65536 {
-                    g.clear();
+    if let Some(post_st) = path_olean_stat_sig(olean_path) {
+        if Some(post_st) == cur_stat && olean_stat_sig_trusted_at(&post_st, read_started_ns) {
+            if let Ok(mut g) = memo.lock() {
+                if current_memo_window() == window {
+                    if g.len() >= 65536 {
+                        g.clear();
+                    }
+                    g.insert(
+                        olean_path.to_path_buf(),
+                        (window, post_st, imps.clone(), is_mod),
+                    );
                 }
-                g.insert(
-                    olean_path.to_path_buf(),
-                    (window, post_st, imps.clone(), is_mod),
-                );
             }
         }
     }
@@ -15718,16 +15828,19 @@ fn verify_and_hash_artifact_bytes(
         );
     }
     let window = current_memo_window();
-    let art_stat = path_stat_fingerprint(artifact_path);
+    let art_stat = path_olean_stat_sig(artifact_path);
     let hash_path = PathBuf::from(format!("{}.hash", artifact_path.display()));
     let sidecar_stat = if check_existing_sidecar {
-        path_stat_fingerprint(&hash_path)
+        path_olean_stat_sig(&hash_path)
     } else {
         None
     };
     let memo = ARTIFACT_LAKE_HASH_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(ast) = art_stat {
-        if !require_hash_file || sidecar_stat.is_some() {
+        if crate::zygote::dev_records_subsecond_timestamps(&ast)
+            && sidecar_stat.is_none_or(|s| crate::zygote::dev_records_subsecond_timestamps(&s))
+            && (!require_hash_file || sidecar_stat.is_some())
+        {
             if let Ok(g) = memo.lock() {
                 if let Some(&(w, cached_ast, cached_sst, cached_h)) = g.get(artifact_path) {
                     if w == window
@@ -15740,6 +15853,7 @@ fn verify_and_hash_artifact_bytes(
             }
         }
     }
+    let read_started_ns = crate::zygote::wall_clock_ns();
     let bytes = fs::read(artifact_path)?;
     if artifact_path.extension().and_then(|s| s.to_str()) == Some("olean")
         && (bytes.len() < 32 || !bytes.starts_with(b"olean"))
@@ -15773,21 +15887,27 @@ fn verify_and_hash_artifact_bytes(
             );
         }
     }
-    if let Some(post_ast) = path_stat_fingerprint(artifact_path) {
+    if let Some(post_ast) = path_olean_stat_sig(artifact_path) {
         let post_sst = if check_existing_sidecar {
-            path_stat_fingerprint(&hash_path)
+            path_olean_stat_sig(&hash_path)
         } else {
             None
         };
-        if let Ok(mut g) = memo.lock() {
-            if current_memo_window() == window {
-                if g.len() >= 131_072 {
-                    g.clear();
+        if Some(post_ast) == art_stat
+            && post_sst == sidecar_stat
+            && olean_stat_sig_trusted_at(&post_ast, read_started_ns)
+            && post_sst.is_none_or(|s| olean_stat_sig_trusted_at(&s, read_started_ns))
+        {
+            if let Ok(mut g) = memo.lock() {
+                if current_memo_window() == window {
+                    if g.len() >= 131_072 {
+                        g.clear();
+                    }
+                    g.insert(
+                        artifact_path.to_path_buf(),
+                        (window, post_ast, post_sst, actual_h),
+                    );
                 }
-                g.insert(
-                    artifact_path.to_path_buf(),
-                    (window, post_ast, post_sst, actual_h),
-                );
             }
         }
     }

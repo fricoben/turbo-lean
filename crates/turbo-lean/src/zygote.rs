@@ -1123,18 +1123,18 @@ static ZYGOTE_POOL: std::sync::OnceLock<
 /// import pipeline, and a forced filesystem timestamp granularity. Thread-local, so parallel
 /// tests never observe each other's hooks; compiled out of non-test builds.
 #[cfg(test)]
-mod digest_test_hooks {
+pub(crate) mod digest_test_hooks {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     type Hook = Box<dyn FnMut()>;
     thread_local! {
         static HOOKS: RefCell<HashMap<&'static str, Hook>> = RefCell::new(HashMap::new());
-        pub(super) static FORCED_TS_GRANULARITY_NS: Cell<Option<i128>> = const { Cell::new(None) };
+        pub(crate) static FORCED_TS_GRANULARITY_NS: Cell<Option<i128>> = const { Cell::new(None) };
     }
     pub(super) fn set(name: &'static str, hook: impl FnMut() + 'static) {
         HOOKS.with(|h| h.borrow_mut().insert(name, Box::new(hook)));
     }
-    pub(super) fn clear() {
+    pub(crate) fn clear() {
         HOOKS.with(|h| h.borrow_mut().clear());
         FORCED_TS_GRANULARITY_NS.with(|g| g.set(None));
     }
@@ -1156,19 +1156,19 @@ fn run_digest_test_hook(_name: &'static str) {
     digest_test_hooks::run(_name);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OleanFileStatSig {
-    dev: u64,
-    ino: u64,
-    mtime_sec: i64,
-    mtime_nsec: i64,
-    ctime_sec: i64,
-    ctime_nsec: i64,
-    size: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OleanFileStatSig {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) mtime_sec: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) ctime_sec: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) size: u64,
 }
 
 impl OleanFileStatSig {
-    fn from_meta(meta: &fs::Metadata) -> Self {
+    pub(crate) fn from_meta(meta: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1212,7 +1212,7 @@ impl OleanFileStatSig {
         }
     }
 
-    fn ctime_ns(&self) -> i128 {
+    pub(crate) fn ctime_ns(&self) -> i128 {
         (self.ctime_sec as i128) * 1_000_000_000 + (self.ctime_nsec as i128)
     }
 }
@@ -1230,14 +1230,14 @@ impl OleanFileStatSig {
 ///
 /// Everything else re-hashes the bytes and memoizes nothing: coarse or unproven granularity
 /// (FAT, ext3, HFS+, some network/FUSE filesystems), recent `ctime`s, and non-Unix hosts.
-const STAT_TRUST_WINDOW_NS: i128 = 2_000_000_000;
+pub(crate) const STAT_TRUST_WINDOW_NS: i128 = 2_000_000_000;
 
 static TS_SUBSECOND_BY_DEV: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<u64, bool>>,
 > = std::sync::OnceLock::new();
 
 /// Whether `sig.dev` is proven to store sub-second timestamps (rule 1 above).
-fn dev_records_subsecond_timestamps(sig: &OleanFileStatSig) -> bool {
+pub(crate) fn dev_records_subsecond_timestamps(sig: &OleanFileStatSig) -> bool {
     #[cfg(test)]
     if digest_test_hooks::FORCED_TS_GRANULARITY_NS
         .with(|c| c.get())
@@ -1819,7 +1819,7 @@ pub(crate) enum ClosureBinding {
     Unproven,
 }
 
-fn wall_clock_ns() -> i128 {
+pub(crate) fn wall_clock_ns() -> i128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
