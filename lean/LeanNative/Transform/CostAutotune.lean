@@ -1,9 +1,14 @@
 import LeanNative.Transform.Pass
 import LeanNative.Transform.Superopt
+import LeanNative.Spec
 
 namespace LeanNative.Transform
 
 open LeanNative.IR
+
+export _root_.LeanNative.Spec (CorpusTimingSample meetsOnePercentE2EGain corpusProdBaseline
+  corpusProdCandidate meetsCorpusGeomeanOnePercentGain CandidateAblationSample
+  candidateAblationSurvives keepSiteByAblations)
 
 structure OpTimingSample where
   operation : String
@@ -77,127 +82,6 @@ def HardwareCostProfile.toJson (p : HardwareCostProfile) : String :=
   "{" ++ String.intercalate "," (
     strings.map (fun (key, value) => "\"" ++ key ++ "\":\"" ++ jsonEscape value ++ "\"") ++
     numbers.map (fun (key, value) => "\"" ++ key ++ "\":" ++ toString value) ++ selection) ++ "}"
-
-structure CorpusTimingSample where
-  baselineNs : Nat
-  candidateNs : Nat
-  hits : Nat
-  declName : String := ""
-  deriving Repr, DecidableEq, Inhabited, BEq
-
-def meetsOnePercentE2EGain (b c : Nat) : Bool :=
-  b > 0 && c * 100 <= b * 99
-
-def corpusProdBaseline (corpus : List CorpusTimingSample) : Nat :=
-  corpus.foldl (fun acc s => acc * s.baselineNs) 1
-
-def corpusProdCandidate (corpus : List CorpusTimingSample) : Nat :=
-  corpus.foldl (fun acc s => acc * s.candidateNs) 1
-
-def meetsCorpusGeomeanOnePercentGain (corpus : List CorpusTimingSample) : Bool :=
-  !corpus.isEmpty &&
-    corpus.all (fun s => s.baselineNs > 0 && s.candidateNs > 0) &&
-    corpusProdCandidate corpus * (100 ^ corpus.length) <=
-      corpusProdBaseline corpus * (99 ^ corpus.length)
-
-structure CandidateAblationSample where
-  siteIdx : Nat
-  declName : String := ""
-  baselineNs : Nat
-  soloCandidateNs : Nat
-  hits : Nat := 1
-  workloadPairs : List (Nat × Nat) := []
-  deriving Repr, DecidableEq, Inhabited, BEq
-
-def candidateAblationSurvives (s : CandidateAblationSample) : Bool :=
-  s.hits > 0 && s.baselineNs > 0 && s.soloCandidateNs > 0 &&
-    meetsCorpusGeomeanOnePercentGain (s.workloadPairs.map fun (b, c) =>
-      { baselineNs := b, candidateNs := c, hits := s.hits })
-
-def keepSiteByAblations (ablations : List CandidateAblationSample) (siteIdx : Nat)
-    (expectedPairs : Nat := 1) : Bool :=
-  let matching := ablations.filter (fun s => s.siteIdx == siteIdx)
-  !matching.isEmpty && matching.all (fun s =>
-    s.workloadPairs.length == expectedPairs && candidateAblationSurvives s)
-
-def superoptCodeSelective (p : HardwareCostProfile) (targetLabel declName : String)
-    (keepIdx : Nat → Bool) : LNIRCode → Nat → LNIRCode × List SuperoptRewriteRecord × Nat
-  | .letBind dst ty (.scalar se) k, nextIdx =>
-    match superoptScalarExprCore p targetLabel declName se with
-    | (se', some r) =>
-      let keep := keepIdx nextIdx
-      let chosen := if keep then se' else se
-      let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k (nextIdx + 1)
-      (.letBind dst ty (.scalar chosen) k', if keep then r :: kRecs else kRecs, nextIdx')
-    | (_, none) =>
-      let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-      (.letBind dst ty (.scalar se) k', kRecs, nextIdx')
-  | .letBind dst ty val k, nextIdx =>
-    let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-    (.letBind dst ty val k', kRecs, nextIdx')
-  | .rawStore pv iv vv ety k, nextIdx =>
-    let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-    (.rawStore pv iv vv ety k', kRecs, nextIdx')
-  | .incRef ov c k, nextIdx =>
-    let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-    (.incRef ov c k', kRecs, nextIdx')
-  | .decRef ov c k, nextIdx =>
-    let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-    (.decRef ov c k', kRecs, nextIdx')
-  | .ite cv t e, nextIdx =>
-    let (t', tRecs, midIdx) := superoptCodeSelective p targetLabel declName keepIdx t nextIdx
-    let (e', eRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx e midIdx
-    (.ite cv t' e', tRecs ++ eRecs, nextIdx')
-  | .seqFor iv lv hv av ai aty step k, nextIdx =>
-    let (step', sRecs, midIdx) := superoptCodeSelective p targetLabel declName keepIdx step nextIdx
-    let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k midIdx
-    (.seqFor iv lv hv av ai aty step' k', sRecs ++ kRecs, nextIdx')
-  | .parFor ov lv ins ety (.customScalar idxVar inVars body) k, nextIdx =>
-    match superoptScalarExprCore p targetLabel declName body with
-    | (body', some r) =>
-      let keep := keepIdx nextIdx
-      let chosen := if keep then body' else body
-      let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k (nextIdx + 1)
-      (.parFor ov lv ins ety (.customScalar idxVar inVars chosen) k',
-        if keep then r :: kRecs else kRecs, nextIdx')
-    | (_, none) =>
-      let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-      (.parFor ov lv ins ety (.customScalar idxVar inVars body) k', kRecs, nextIdx')
-  | .parFor ov lv ins ety kern k, nextIdx =>
-    let (k', kRecs, nextIdx') := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
-    (.parFor ov lv ins ety kern k', kRecs, nextIdx')
-  | .ret v, nextIdx => (.ret v, [], nextIdx)
-  | .unreachable, nextIdx => (.unreachable, [], nextIdx)
-
-def superoptDeclSelective (p : HardwareCostProfile) (targetLabel : String)
-    (keepIdx : Nat → Bool) (d : LNIRDecl) (nextIdx : Nat) :
-    LNIRDecl × List SuperoptRewriteRecord × Nat :=
-  let (body', recs, count) := superoptCodeSelective p targetLabel d.name keepIdx d.body 0
-  let assurance' :=
-    if recs.isEmpty then d.assurance
-    else AssuranceLevel.combine d.assurance .verifiedKernelProof
-  ({ d with body := body', assurance := assurance' }, recs, nextIdx + count)
-
-def superoptModuleSelective (p : HardwareCostProfile) (keepIdx : String → Nat → Bool)
-    (m : LNIRModule) : LNIRModule × SuperoptReport × Nat :=
-  let targetLabel := s!"{p.target.toString}:{p.profileId}"
-  let costBefore := m.decls.foldl (fun acc d => acc + codeScalarCostWithProfile p d.body) 0
-  let (decls', allRecs, totalSites) := m.decls.foldl (fun (dAcc, rAcc, idx) d =>
-    let (d', recs, idx') := superoptDeclSelective p targetLabel (keepIdx d.name) d idx
-    (dAcc ++ [d'], rAcc ++ recs, idx')
-  ) ([], [], 0)
-  let m' : LNIRModule := { m with decls := decls' }
-  let costAfter := m'.decls.foldl (fun acc d => acc + codeScalarCostWithProfile p d.body) 0
-  (m', {
-    moduleName := m.moduleName
-    schemaVersion := "lean-native-superopt-v1"
-    target := targetLabel
-    totalDecls := m.decls.length
-    rewritesApplied := allRecs.length
-    totalCostBefore := costBefore
-    totalCostAfter := costAfter
-    records := allRecs
-  }, totalSites)
 
 def superoptModuleWithProfile (p : HardwareCostProfile) (m : LNIRModule) : LNIRModule × SuperoptReport :=
   let (candidate, report, _) := superoptModuleSelective p

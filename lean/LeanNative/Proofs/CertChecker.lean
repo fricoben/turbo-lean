@@ -109,6 +109,7 @@ def verifiedTheoremRegistry : List String :=
     "meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive",
     "superoptModuleWithCalibratedProfile_sound",
     "superoptCodeSelective_sound",
+    "foldl_decls_mem_acc", "foldl_decls_refines",
     "superoptDeclSelective_sound",
     "superoptModuleSelective_sound",
     "autotuneCodeWithAmdahl_sound", "autotuneCodeWithAmdahl_uncalibrated_preserves",
@@ -133,6 +134,7 @@ def verifiedTheoremRegistry : List String :=
     "HeapState.storageLoad_after_storageStore_same", "HeapState.storageLoad_after_storageStore_ne"
   ]
   let spec := [
+    "e2e_gain_gate_sound", "insufficient_gain_rejects_e2e",
     "untrusted_opt_plugin_tv_gate_sound", "untrusted_opt_plugin_code_refines",
     "untrusted_opt_plugin_timeout_fallback", "untrusted_opt_plugin_reject_fallback",
     "opt_pipeline_two_step_refines", "opt_pipeline_chain_refines",

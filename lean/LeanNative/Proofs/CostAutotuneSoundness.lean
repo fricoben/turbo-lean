@@ -6,6 +6,7 @@ set_option autoImplicit false
 namespace LeanNative.Proofs
 
 open LeanNative.IR LeanNative.Semantics LeanNative.Transform
+open LeanNative.Spec
 
 theorem calibrateHardwareProfile_preserves_target (base : HardwareCostProfile)
     (samples : List OpTimingSample) :
@@ -55,158 +56,6 @@ theorem meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive :
     meetsOnePercentE2EGain totals.baselineNs totals.candidateNs = true ∧
     meetsCorpusGeomeanOnePercentGain corpus = false := by
   decide
-
-theorem superoptCodeSelective_sound (p : HardwareCostProfile) (targetLabel declName : String)
-    (keepIdx : Nat → Bool) (code : LNIRCode) (nextIdx : Nat) :
-    CodeRefines code (superoptCodeSelective p targetLabel declName keepIdx code nextIdx).1 := by
-  induction code generalizing nextIdx with
-  | letBind dst ty val k ih =>
-    cases val with
-    | scalar se =>
-      simp only [superoptCodeSelective]
-      cases hse : superoptScalarExprCore p targetLabel declName se with
-      | mk se' recOpt =>
-        cases recOpt with
-        | none =>
-          exact CodeRefines.letBind_congr (ExprRefines.refl _) (ih nextIdx)
-        | some r =>
-          dsimp only []
-          have hchoose :
-              ExprRefines (.scalar se) (.scalar (if keepIdx nextIdx then se' else se)) := by
-            split
-            · have hsnd := superoptScalarExprCore_sound p targetLabel declName se
-              rw [hse] at hsnd
-              exact hsnd
-            · exact ExprRefines.refl _
-          exact CodeRefines.letBind_congr hchoose (ih (nextIdx + 1))
-    | _ =>
-      simp only [superoptCodeSelective]
-      exact CodeRefines.letBind_congr (ExprRefines.refl _) (ih nextIdx)
-  | rawStore pv iv vv ety k ih =>
-    simp only [superoptCodeSelective]
-    exact CodeRefines.rawStore_congr (ih nextIdx)
-  | incRef ov c k ih =>
-    simp only [superoptCodeSelective]
-    exact CodeRefines.incRef_congr (ih nextIdx)
-  | decRef ov c k ih =>
-    simp only [superoptCodeSelective]
-    exact CodeRefines.decRef_congr (ih nextIdx)
-  | ite cv t e iht ihe =>
-    simp only [superoptCodeSelective]
-    exact CodeRefines.ite_congr (iht nextIdx) (ihe _)
-  | seqFor iv lv hv av ai aty step k ihs ihk =>
-    intro fuel env st v st' hsrc
-    simp only [superoptCodeSelective, evalCode] at hsrc ⊢
-    split at hsrc <;> try contradiction
-    next lo hi init hlo hhi hinit =>
-      split at hsrc <;> try contradiction
-      next finalAcc finalSt hloop =>
-        rw [evalSeqLoop_refines _ _ _ _ _ _ _ _ _ (finalAcc, finalSt) (ihs nextIdx fuel) hloop]
-        exact ihk _ fuel _ _ v st' hsrc
-  | parFor ov lv ins ety kern k ih =>
-    cases kern with
-    | customScalar idxVar inVars body =>
-      intro fuel env st v st' hsrc
-      simp only [superoptCodeSelective]
-      cases hse : superoptScalarExprCore p targetLabel declName body with
-      | mk body' recOpt =>
-        cases recOpt with
-        | none =>
-          simp only [evalCode] at hsrc ⊢
-          cases hpar : evalParFor fuel env st lv ins (.customScalar idxVar inVars body) with
-          | error err => simp [hpar] at hsrc
-          | ok pair =>
-            rw [hpar] at hsrc
-            exact ih nextIdx fuel (env.bind ov pair.1) pair.2 v st' hsrc
-        | some r =>
-          dsimp only []
-          simp only [evalCode] at hsrc ⊢
-          cases hpar : evalParFor fuel env st lv ins (.customScalar idxVar inVars body) with
-          | error err => simp [hpar] at hsrc
-          | ok pair =>
-            rw [hpar] at hsrc
-            have hchoose :
-                ExprRefines (.scalar body)
-                  (.scalar (if keepIdx nextIdx then body' else body)) := by
-              split
-              · have hsnd := superoptScalarExprCore_sound p targetLabel declName body
-                rw [hse] at hsnd
-                exact hsnd
-              · exact ExprRefines.refl _
-            have hpar' :=
-              evalParFor_customScalar_refines fuel env st lv ins idxVar inVars body
-                (if keepIdx nextIdx then body' else body) pair hchoose hpar
-            rw [hpar']
-            exact ih (nextIdx + 1) fuel (env.bind ov pair.1) pair.2 v st' hsrc
-    | _ =>
-      simp only [superoptCodeSelective]
-      exact CodeRefines.parFor_congr (ih nextIdx)
-  | ret _ =>
-    simp only [superoptCodeSelective]
-    exact CodeRefines.refl _
-  | unreachable =>
-    simp only [superoptCodeSelective]
-    exact CodeRefines.refl _
-
-theorem superoptDeclSelective_sound (p : HardwareCostProfile) (targetLabel : String)
-    (keepIdx : Nat → Bool) (d : LNIRDecl) (nextIdx : Nat) :
-    CodeRefines d.body (superoptDeclSelective p targetLabel keepIdx d nextIdx).1.body := by
-  unfold superoptDeclSelective
-  exact superoptCodeSelective_sound p targetLabel d.name keepIdx d.body 0
-
-private theorem foldl_selective_decls_mem_acc (p : HardwareCostProfile) (targetLabel : String)
-    (keepIdx : String → Nat → Bool) (ds : List LNIRDecl) (dAcc : List LNIRDecl)
-    (rAcc : List SuperoptRewriteRecord) (idx : Nat) (x : LNIRDecl) (hx : x ∈ dAcc) :
-    x ∈ (ds.foldl (fun (accD, accR, curIdx) d =>
-      let (d', recs, nextIdx) := superoptDeclSelective p targetLabel (keepIdx d.name) d curIdx
-      (accD ++ [d'], accR ++ recs, nextIdx)) (dAcc, rAcc, idx)).1 := by
-  induction ds generalizing dAcc rAcc idx with
-  | nil => exact hx
-  | cons d0 rest ih =>
-    simp only [List.foldl]
-    exact ih
-      (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
-      (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
-      (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.2
-      (List.mem_append_left _ hx)
-
-private theorem foldl_selective_decls_refines (p : HardwareCostProfile) (targetLabel : String)
-    (keepIdx : String → Nat → Bool) (ds : List LNIRDecl) (dAcc : List LNIRDecl)
-    (rAcc : List SuperoptRewriteRecord) (idx : Nat) :
-    ∀ d ∈ ds, ∃ d' ∈ (ds.foldl (fun (accD, accR, curIdx) d =>
-      let (d', recs, nextIdx) := superoptDeclSelective p targetLabel (keepIdx d.name) d curIdx
-      (accD ++ [d'], accR ++ recs, nextIdx)) (dAcc, rAcc, idx)).1,
-      CodeRefines d.body d'.body := by
-  intro d hd
-  induction ds generalizing dAcc rAcc idx with
-  | nil => cases hd
-  | cons d0 rest ih =>
-    simp only [List.foldl, List.mem_cons] at hd ⊢
-    cases hd with
-    | inl heq =>
-      subst d
-      refine ⟨(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1, ?_,
-        superoptDeclSelective_sound p targetLabel (keepIdx d0.name) d0 idx⟩
-      exact foldl_selective_decls_mem_acc p targetLabel keepIdx rest
-        (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
-        (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
-        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.2
-        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1
-        (List.mem_append_right _ (List.mem_singleton.mpr rfl))
-    | inr hmem =>
-      exact ih
-        (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
-        (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
-        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.2 hmem
-
-theorem superoptModuleSelective_sound (p : HardwareCostProfile) (keepIdx : String → Nat → Bool)
-    (m : LNIRModule) :
-    ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleSelective p keepIdx m).1.decls,
-      CodeRefines d.body d'.body := by
-  intro d hd
-  unfold superoptModuleSelective
-  exact foldl_selective_decls_refines p s!"{p.target.toString}:{p.profileId}"
-    keepIdx m.decls [] [] 0 d hd
 
 theorem superoptModuleWithProfile_sound (p : HardwareCostProfile) (m : LNIRModule) :
     ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleWithProfile p m).1.decls, CodeRefines d.body d'.body := by
@@ -260,7 +109,7 @@ theorem autotuneSuperoptModule_sound (base : HardwareCostProfile)
   dsimp only []
   split
   · exact superoptModuleSelective_sound (calibrateHardwareProfile base samples)
-      (fun decl => keepDeclSiteByAblations ablations decl corpus.length) m d hd
+      (fun decl => keepDeclSiteByAblations ablations decl corpus.length) m _ d hd
   · exact ⟨d, hd, CodeRefines.refl _⟩
 
 theorem costAutotune_amdahl_gate_nonvacuous :
