@@ -8321,14 +8321,22 @@ pub(crate) fn root_module_lake_sidecars_current(cfg: &ProjectConfig, imp: &str) 
         return false;
     };
     let hdr = parse_header_info(&src);
+    let needs_c = spec.precompile_modules
+        || spec.emit_c_default
+        || spec.is_exe_target
+        || hdr.has_c_export
+        || global_emit_c_enabled();
     hdr.header_error.is_none()
-        && verify_module_lake_sidecars(
+        && verify_module_lake_sidecars_inner_opts_ext(
             &spec_olean_path(&spec),
             Some(&spec.build_ir_dir),
             &module_name_to_rel_slash(imp),
             &src,
             hdr.is_module,
-            spec.precompile_modules || spec.is_exe_target,
+            needs_c,
+            false,
+            true,
+            !needs_c,
         )
         .is_ok()
 }
@@ -8783,30 +8791,6 @@ fn prebuilt_olean_export_info(
     )
 }
 
-#[allow(dead_code)]
-fn collect_fresh_prebuilt_closure(
-    cfg: &ProjectConfig,
-    imp: &str,
-    olean_path: &Path,
-) -> Option<Vec<(String, PathBuf)>> {
-    let mut cache = LakeClosureCache::default();
-    let mut mod_visiting = HashSet::new();
-    let mut pb_visiting = HashSet::new();
-    let mut pairs = vec![(imp.to_string(), olean_path.to_path_buf())];
-    prebuilt_closure_export_info(
-        cfg,
-        false,
-        olean_path,
-        &mut cache,
-        &mut mod_visiting,
-        &mut pb_visiting,
-        Some(&mut pairs),
-    )?;
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    pairs.dedup_by(|a, b| a.0 == b.0);
-    Some(pairs)
-}
-
 /// Fail-closed Lake/turbo closure verifier for `spec`, returning its `LakeModuleExportInfo` only
 /// when `spec` and every transitive import are proven current against sources, toolchain/options,
 /// sidecars, and import export hashes (or turbo manifest pins).
@@ -8895,7 +8879,7 @@ fn lake_closure_export_info_inner(
             needs_c,
             false,
             true,
-            !raw_has_entry && manifest_entry.is_none() && !needs_c,
+            !needs_c,
         )
         .ok()?;
         let (arts_trace, meta_arts_trace, all_arts_trace) =
@@ -8906,7 +8890,7 @@ fn lake_closure_export_info_inner(
         if manifest_entry.is_none()
             && !cache.post_lake_refresh
             && !expected_lake_inputs.is_empty()
-            && (cached_manifest.raw.is_some()
+            && ((spec.is_root_pkg && cached_manifest.raw.is_some())
                 || package_by_root(cfg, &spec.pkg_root).is_some_and(|p| !p.inputs.is_empty()))
         {
             return None;
@@ -8931,7 +8915,7 @@ fn lake_closure_export_info_inner(
             }
             if spec.native_unsupported.is_some()
                 || spec.link_unsupported.is_some()
-                || !spec.extern_lib_digests.is_empty()
+                || (spec.precompile_modules && !spec.extern_lib_digests.is_empty())
             {
                 return None;
             }
@@ -9294,11 +9278,11 @@ fn dep_pkg_import_pins_consistent(
             .and_then(|m| m.modules.get(&rel_src))
             .cloned()
         else {
-            if strict_policy
+            if (strict_policy && (cur.is_root_pkg || !is_git_pinned_manifest_package(cfg, &cur)))
                 || raw_has_entry
                 || (!cache.post_lake_refresh
                     && !expected_lake_inputs.is_empty()
-                    && (cached_manifest.raw.is_some()
+                    && ((cur.is_root_pkg && cached_manifest.raw.is_some())
                         || package_by_root(cfg, &cur.pkg_root)
                             .is_some_and(|p| !p.inputs.is_empty())))
                 || !olean_digest_is(cfg, &spec_olean_path(&cur), &pin)
@@ -9306,7 +9290,7 @@ fn dep_pkg_import_pins_consistent(
                 return false;
             }
             let mut visiting = HashSet::new();
-            if lake_closure_export_info(cfg, &cur, false, cache, &mut visiting).is_none() {
+            if lake_closure_export_info(cfg, &cur, strict_policy, cache, &mut visiting).is_none() {
                 return false;
             }
             seen.insert(key, pin);
@@ -9492,10 +9476,10 @@ fn verify_trace_outputs_against_artifacts_ext(
     if let Some(c_h) = c_h_opt {
         let expected_c = format!("{:016x}.c", c_h);
         let nil_c = format!("{LAKE_NIL_HASH:016x}.c");
-        let c_out_ok = tv
-            .pointer("/outputs/c")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == expected_c || (allow_stock_missing_c_outputs && s == nil_c));
+        let c_out_ok = match tv.pointer("/outputs/c").and_then(|v| v.as_str()) {
+            Some(s) => s == expected_c || (allow_stock_missing_c_outputs && s == nil_c),
+            None => allow_stock_missing_c_outputs && tv.pointer("/outputs/o/0").is_some(),
+        };
         if tv.pointer("/outputs/m").and_then(|v| v.as_bool()) != Some(is_module)
             || tv.pointer("/outputs/o/0").and_then(|v| v.as_str()) != Some(expected_o.as_str())
             || tv.pointer("/outputs/i").and_then(|v| v.as_str()) != Some(expected_i.as_str())
@@ -19911,7 +19895,7 @@ fn probe_warm_on_disk_module_candidate(
 
     if node.native_unsupported.is_some()
         || node.link_unsupported.is_some()
-        || !node.extern_lib_digests.is_empty()
+        || (node.precompile_modules && !node.extern_lib_digests.is_empty())
         || !node.weak_args.is_empty()
     {
         return None;
@@ -19922,13 +19906,16 @@ fn probe_warm_on_disk_module_candidate(
         .to_string_lossy()
         .strip_suffix(&format!("{rel_slash}.c"))
         .map(|s| PathBuf::from(s.trim_end_matches('/')));
-    verify_module_lake_sidecars(
+    verify_module_lake_sidecars_inner_opts_ext(
         &node.olean_path,
         ir_dir.as_deref(),
         &rel_slash,
         &src_raw,
         node.is_module,
         node.needs_c,
+        true,
+        true,
+        !node.needs_c,
     )
     .ok()?;
     let tv: serde_json::Value =
@@ -35781,6 +35768,182 @@ globs = ["Down.+"]
             ev3.iter().any(|e| e.kind == "audit_subprocess_start"),
             "policy_digest change must invalidate `kernel_audited_oleans_auth` shortcut and re-audit"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_git_pinned_extern_lib_dep_mixed_manifest_stays_fresh_for_check() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("git_extern_lib_mixed_manifest");
+        let dep_origin = dir.join("dep_origin");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_sys");
+        fs::create_dir_all(dep_origin.join("DepSys"))?;
+        fs::create_dir_all(dep_origin.join("c"))?;
+        fs::create_dir_all(proj.join("App"))?;
+        let tc = "leanprover/lean4:v4.35.0\n";
+        fs::write(dep_origin.join("lean-toolchain"), tc)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep_origin.join("c/shim.c"),
+            "int dep_sys_shim_val(void) { return 42; }\n",
+        )?;
+        fs::write(
+            dep_origin.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\nopen System (FilePath)\npackage «dep_sys»\ntarget shim_o pkg : FilePath := do\n  let oFile := pkg.buildDir / \"c\" / \"shim.o\"\n  let srcJob ← inputTextFile <| pkg.dir / \"c\" / \"shim.c\"\n  buildO oFile srcJob #[] #[\"-O2\", \"-fPIC\"] \"cc\"\nextern_lib libdep_sys_shim pkg := do\n  let o ← shim_o.fetch\n  buildStaticLib (pkg.staticLibDir / nameToStaticLib \"dep_sys_shim\") #[o]\n@[default_target]\nlean_lib «DepSys» where\n  roots := #[`DepSys]\n  precompileModules := false\n",
+        )?;
+        fs::write(
+            dep_origin.join("DepSys/Pure.lean"),
+            "def pureVal : Nat := 7\n",
+        )?;
+        fs::write(
+            dep_origin.join("DepSys/Ffi.lean"),
+            "import DepSys.Pure\ndef ffiHelper : Nat := pureVal + 1\n",
+        )?;
+        fs::write(
+            dep_origin.join("DepSys.lean"),
+            "import DepSys.Pure\nimport DepSys.Ffi\n",
+        )?;
+        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("git"));
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+            vec!["commit", "-m", "init"],
+        ] {
+            let st = Command::new(&git_bin)
+                .args(&args)
+                .current_dir(&dep_origin)
+                .status()?;
+            anyhow::ensure!(st.success(), "git init dep_origin failed on {args:?}");
+        }
+        let rev_out = Command::new(&git_bin)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dep_origin)
+            .output()?;
+        anyhow::ensure!(rev_out.status.success());
+        let rev = String::from_utf8(rev_out.stdout)?.trim().to_string();
+        fs::create_dir_all(dep.parent().unwrap())?;
+        let clone_st = Command::new(&git_bin)
+            .args(["clone", "--quiet"])
+            .arg(&dep_origin)
+            .arg(&dep)
+            .status()?;
+        anyhow::ensure!(clone_st.success(), "git clone dep_origin failed");
+        fs::write(
+            proj.join("lakefile.lean"),
+            format!(
+                "import Lake\nopen Lake DSL\npackage «app»\nrequire «dep_sys» from git {:?} @ {:?}\n@[default_target]\nlean_lib «App» where\n  globs := #[.submodules `App]\n@[default_target]\nlean_exe «app-exe» where\n  root := `App.Exe\n  supportInterpreter := false\n",
+                dep_origin.to_string_lossy(),
+                rev
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git",
+                    "scope": "",
+                    "name": "dep_sys",
+                    "manifestFile": "lake-manifest.json",
+                    "rev": rev,
+                    "inherited": false,
+                    "configFile": "lakefile.lean",
+                    "inputRev": rev,
+                    "url": dep_origin.to_string_lossy()
+                }]
+            })
+            .to_string(),
+        )?;
+        fs::write(
+            proj.join("App/SpecMod.lean"),
+            "import DepSys.Pure\ntheorem spec_ok : pureVal = 7 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("App/Exe.lean"),
+            "import DepSys.Ffi\ndef main : IO Unit := IO.println s!\"{ffiHelper}\"\n",
+        )?;
+
+        fs::write(
+            proj.join("App/TopMod.lean"),
+            "import App.SpecMod\ntheorem top_ok : pureVal = 7 := spec_ok\n",
+        )?;
+
+        let cfg = resolve_project_config(&proj)?;
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
+        let lake_st = Command::new(&lake_bin)
+            .arg("build")
+            .current_dir(&proj)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .status()?;
+        anyhow::ensure!(lake_st.success(), "initial stock lake build failed");
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        // Force `DepSys.Ffi` (needed for C link by `app-exe`) to be compiled into `dep_sys`'s
+        // `.turbo_verified_sources.json` while `DepSys.Pure` remains a stock Lake prebuilt artifact,
+        // and leave a `.c` file on disk for `App.SpecMod` before stock `lake build +App.SpecMod`.
+        let _ = fs::remove_file(dep.join(".lake/build/ir/DepSys/Ffi.c"));
+        build_project_modules_native(&mut store, &proj, &[], "trusted", 2, false, true, None)?;
+        assert!(dep
+            .join(".lake/build/.turbo_verified_sources.json")
+            .is_file());
+
+        // Stage and publish the no-`:c` action outputs (`App.SpecMod.trace` has `"outputs": null`),
+        // then emit `:c` so `.lake/build/ir/App/SpecMod.c` (+ `.c.hash`) exist on disk, then
+        // materialize the cached no-`:c` outputs back into the worktree and verify directory `check`.
+        let (staged_no_c, staged_reg_blobs) =
+            crate::lake_build::stage_lake_build_outputs(&store, &proj)?;
+        store.publish_ingested_worktree_action(
+            None,
+            "test_no_c_action_key",
+            &cfg.lean_githash,
+            "module_full",
+            &proj,
+            "app",
+            &staged_reg_blobs,
+            &staged_no_c,
+            1,
+            "trusted",
+            2,
+            None,
+            None,
+        )?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["App:c".to_string()],
+            "trusted",
+            2,
+            false,
+            true,
+            None,
+        )?;
+        assert!(proj.join(".lake/build/ir/App/SpecMod.c").is_file());
+        store.materialize_into_worktree(&proj, "app", &staged_no_c)?;
+        assert!(!proj.join(".lake/build/ir/App/SpecMod.c").exists());
+        assert!(!proj.join(".lake/build/ir/App/SpecMod.c.hash").exists());
+
+        let chk = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App/SpecMod.lean"),
+            Some("spec_ok".to_string()),
+            proj.clone(),
+        )?;
+        assert_eq!(chk["status"], "theorem_verified");
+        let dir_chk = crate::check::evaluate_check_command_value(
+            &mut store,
+            proj.join("App"),
+            None,
+            proj.clone(),
+        )?;
+        assert_eq!(dir_chk["status"], "file_verified");
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

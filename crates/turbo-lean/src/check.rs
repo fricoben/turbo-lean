@@ -2237,20 +2237,6 @@ fn check_directory(
     }
 
     let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
-    let dirty: Vec<String> = parsed_files
-        .iter()
-        .filter(|(_, _, _, split, _, _)| !split.hygiene.is_clean_for_certification())
-        .map(|(lf, _, _, split, _, _)| {
-            format!(
-                "{}: {}",
-                lf.display(),
-                split.hygiene.disallowed_items().join(", ")
-            )
-        })
-        .collect();
-    if !dirty.is_empty() {
-        anyhow::bail!("Soundness hygiene violation in {}", dirty.join("; "));
-    }
     let cached_map = store.batch_get_theorem_shards(&all_shard_keys, "trusted")?;
 
     let mut total_hits = 0usize;
@@ -2259,7 +2245,8 @@ fn check_directory(
     for (lf, src_blake3, src, split, file_keys, file_lean_args) in parsed_files {
         let file_hygiene_clean = split.hygiene.is_clean_for_certification();
         if !file_hygiene_clean {
-            deferred_kernel_gate_files.push((lf, src, file_lean_args));
+            let names: HashSet<String> = split.shards.iter().map(|s| s.rooted_name()).collect();
+            deferred_kernel_gate_files.push((lf, src, names, file_lean_args));
             continue;
         }
         let mut file_uncached = Vec::new();
@@ -2276,10 +2263,11 @@ fn check_directory(
         }
     }
 
+    let deferred_verified_files = deferred_kernel_gate_files.len();
     if !deferred_kernel_gate_files.is_empty() {
         let (def_env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let def_lean_bin = resolve_lean_bin(canon_dir)?;
-        for (lf, mut src, file_lean_args) in deferred_kernel_gate_files {
+        for (lf, mut src, names, file_lean_args) in deferred_kernel_gate_files {
             if src.is_empty() {
                 src = fs::read_to_string(&lf).with_context(|| {
                     format!(
@@ -2288,13 +2276,17 @@ fn check_directory(
                     )
                 })?;
             }
-            let out = crate::zygote::run_audited_lean_shard(
-                store,
+            let (out, _) = crate::zygote::run_audited_lean_shard_at_with_types_report(
+                &store.root,
+                &store.fast_staging_dir(),
                 Path::new(&def_lean_bin),
                 &def_env_vars,
                 Some(canon_dir),
+                Some(&lf),
                 &src,
-                &HashSet::new(),
+                &names,
+                false,
+                &[],
                 &file_lean_args,
                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
             )?;
@@ -2314,8 +2306,13 @@ fn check_directory(
     let total_misses: usize = uncached_files.iter().map(|(_, _, _, u, _)| u.len()).sum();
     if total_misses == 0 {
         let elapsed_ms = t0.elapsed().as_millis();
+        let status = if deferred_verified_files == 0 {
+            "all_shards_cached"
+        } else {
+            "file_verified"
+        };
         let out_json = serde_json::json!({
-            "status": "all_shards_cached",
+            "status": status,
             "file": file.display().to_string(),
             "files_checked": dir_files.len(),
             "file_split_cache_hits": split_cache_hits,
@@ -2327,12 +2324,21 @@ fn check_directory(
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
-            } else {
+            } else if deferred_verified_files == 0 {
                 println!(
                     "[turbo-lean] ALL {} THEOREM SHARDS CACHED across {} files in {} ({} ms)",
                     total_hits,
                     dir_files.len(),
                     file.display(),
+                    elapsed_ms
+                );
+            } else {
+                println!(
+                    "[turbo-lean] DIRECTORY VERIFIED across {} files in {} ({} shard hits, {} policy-gated files, {} ms)",
+                    dir_files.len(),
+                    file.display(),
+                    total_hits,
+                    deferred_verified_files,
                     elapsed_ms
                 );
             }
@@ -5305,12 +5311,13 @@ fn check_single_file(
                 src.is_empty() || blake3::hash(src.as_bytes()).to_hex().as_str() != expected_hex
             }
         };
+        let mut actual_hygiene_strictly_clean = hygiene_strictly_clean;
         if needs_fresh_read {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
             let actual_deps = compute_imported_olean_interface_hashes(src, canon_dir, None);
             let actual_split = split_lean_source(src, &actual_deps);
-            if !actual_split.hygiene.is_clean_for_certification() {
+            if !actual_split.hygiene.is_clean_or_deferred_to_kernel_gate() {
                 anyhow::bail!(
                     "Soundness hygiene violation in {}: {}",
                     file.display(),
@@ -5321,6 +5328,7 @@ fn check_single_file(
                     }
                 );
             }
+            actual_hygiene_strictly_clean &= actual_split.hygiene.is_clean_for_certification();
             if actual_split.interface_hash != split.interface_hash
                 || actual_split.shards.len() != split.shards.len()
                 || actual_split
@@ -5344,7 +5352,7 @@ fn check_single_file(
         let mut verified_via_zygote_eval = false;
         let mut eval_stdout_text = String::new();
         let mut eval_messages: Vec<String> = Vec::new();
-        let can_use_zygote_eval = hygiene_strictly_clean
+        let can_use_zygote_eval = actual_hygiene_strictly_clean
             && !crate::zygote::daemon_disabled()
             && !src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
@@ -5531,7 +5539,7 @@ fn check_single_file(
             }
         }
         let dur_ms = t0.elapsed().as_millis() as i64;
-        if hygiene_strictly_clean && !uncached_shards.is_empty() {
+        if actual_hygiene_strictly_clean && !uncached_shards.is_empty() {
             let now = db::now_unix();
             for (shard_key, shard) in uncached_shards {
                 if let SingleflightOutcome::Leader(lease) =
@@ -7844,5 +7852,84 @@ theorem after_macro : ext_magic = 7 := rfl
         }
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_deferred_axiom_policy_single_file_cold_and_directory() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_deferred_policy_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mod")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"def_pol\"\ndefaultTargets = [\"Mod\"]\n[[lean_lib]]\nname = \"Mod\"\nglobs = [\"Mod.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Ax.lean"),
+            "axiom allowedDirAx : True\ntheorem ax_ok : True := allowedDirAx\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Clean.lean"),
+            "theorem clean_ok : 1 + 1 = 2 := rfl\n",
+        )
+        .unwrap();
+
+        let prev_ax = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "allowedDirAx");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 1. Cold single-file check on fresh `TurboStore` must defer to kernel gate and pass.
+            let mut cold_store = TurboStore::open(Some(&tmp_dir.join("store_cold"))).unwrap();
+            let file_res = evaluate_check_command_value(
+                &mut cold_store,
+                proj.join("Mod/Ax.lean"),
+                None,
+                proj.clone(),
+            )
+            .expect("cold single-file check should allow custom allowedDirAx");
+            assert_eq!(file_res["status"], "file_verified");
+
+            // 2. Directory check must defer `Mod/Ax.lean` to kernel gate and pass (both cold and warm).
+            let mut dir_store = TurboStore::open(Some(&tmp_dir.join("store_dir"))).unwrap();
+            let dir_res =
+                evaluate_check_command_value(&mut dir_store, proj.join("Mod"), None, proj.clone())
+                    .expect("directory check should allow custom allowedDirAx");
+            assert_eq!(dir_res["status"], "file_verified");
+            let dir_warm =
+                evaluate_check_command_value(&mut dir_store, proj.join("Mod"), None, proj.clone())
+                    .expect("warm directory check should re-audit deferred file and pass");
+            assert_eq!(dir_warm["status"], "file_verified");
+
+            // 3. Disallowed axiom in directory must still be rejected by the kernel gate.
+            fs::write(
+                proj.join("Mod/Ax.lean"),
+                "axiom forbiddenDirAx : False\ntheorem ax_bad : False := forbiddenDirAx\n",
+            )
+            .unwrap();
+            let bad_err =
+                evaluate_check_command_value(&mut dir_store, proj.join("Mod"), None, proj.clone())
+                    .expect_err("directory check must reject unallowed axiom");
+            assert!(
+                format!("{bad_err:#}").contains("forbiddenDirAx"),
+                "unexpected error: {bad_err:#}"
+            );
+        }));
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
     }
 }

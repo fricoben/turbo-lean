@@ -2930,7 +2930,7 @@ impl TurboStore {
                 == 0
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn has_kernel_replayed_olean(
         &self,
         artifact_digest: &str,
@@ -3566,6 +3566,41 @@ impl TurboStore {
                 db_updates.push((&out.rel_path, &out.blob_hash, mode));
             }
             linked += 1;
+        }
+
+        let output_rel_paths: std::collections::HashSet<&str> = outputs
+            .iter()
+            .filter(|o| !o.rel_path.starts_with("thm:"))
+            .map(|o| o.rel_path.as_str())
+            .collect();
+        for out in outputs {
+            if out.rel_path.starts_with("thm:") || !out.rel_path.ends_with(".trace") {
+                continue;
+            }
+            let Some((prefix, rel_no_ext)) = out.rel_path.rfind("/lib/lean/").and_then(|idx| {
+                let rest = out.rel_path[idx + "/lib/lean/".len()..].strip_suffix(".trace")?;
+                Some((&out.rel_path[..idx], rest))
+            }) else {
+                continue;
+            };
+            for suffix in ["ltar", "ltar.hash", "bc", "bc.hash"] {
+                let ir_rel = format!("{prefix}/ir/{rel_no_ext}.{suffix}");
+                if !output_rel_paths.contains(ir_rel.as_str()) {
+                    let _ = fs::remove_file(canon_root.join(&ir_rel));
+                }
+            }
+            let c_rel = format!("{prefix}/ir/{rel_no_ext}.c");
+            if !output_rel_paths.contains(c_rel.as_str()) {
+                let trace_dst = canon_root.join(&out.rel_path);
+                let trace_outputs_null = fs::read(&trace_dst)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .is_some_and(|tv| tv.get("outputs") == Some(&serde_json::Value::Null));
+                if trace_outputs_null {
+                    let _ = fs::remove_file(canon_root.join(&c_rel));
+                    let _ = fs::remove_file(canon_root.join(format!("{c_rel}.hash")));
+                }
+            }
         }
 
         if db_updates.is_empty() && wt_last_seen.map(|ls| now - ls < 60).unwrap_or(false) {

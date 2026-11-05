@@ -15,7 +15,7 @@ use crate::lake_build::{
 use crate::pack;
 use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -3851,13 +3851,15 @@ pub fn run_ci_verify_command(
     // effective options and lakefile contents, including dependency configuration.
     let cfg = crate::module_builder::resolve_project_config_with_trust(&canon_dir, is_untrusted)
         .context("CI static Lake config validation failed")?;
-    let untrusted_ci_mods = if is_untrusted {
-        let dag = crate::module_builder::build_module_dag_with_trust(&cfg, &[], true)
-            .context("Untrusted CI static module DAG validation failed")?;
-        Some(dag.nodes.keys().cloned().collect::<Vec<String>>())
-    } else {
-        None
-    };
+    let ci_dag = crate::module_builder::build_module_dag_with_trust(&cfg, &[], is_untrusted)
+        .context("CI static module DAG validation failed")?;
+    let dag_root_rel_paths: BTreeSet<String> = ci_dag
+        .nodes
+        .values()
+        .filter(|n| n.is_root_pkg)
+        .map(|n| rel_path_from_dir(&n.src_path, &canon_dir))
+        .collect();
+    let untrusted_ci_mods = is_untrusted.then(|| ci_dag.nodes.keys().cloned().collect::<Vec<_>>());
 
     let mut flagged_files = Vec::new();
     let mut total_files = 0usize;
@@ -4009,7 +4011,10 @@ pub fn run_ci_verify_command(
         || unsafe_policy_nonempty
         || impl_by_policy_nonempty
     {
-        for (_, items) in &mut flagged_files {
+        for (rel_path, items) in &mut flagged_files {
+            if !dag_root_rel_paths.contains(rel_path) {
+                continue;
+            }
             items.retain(|item| match item.rsplit(": ").next() {
                 Some("axiom") if custom_axiom_policy => false,
                 Some("csimp") if is_untrusted && csimp_policy_nonempty => false,
@@ -15290,5 +15295,76 @@ end ParityNs
             "try_head_overlay must verify sorry-removal proof edit without mutating on-disk .lake/build or retaining stale base sorryAx audit"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_ci_verify_rejects_deferred_hygiene_violations_in_non_dag_files() -> Result<()> {
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "ci_verify_non_dag_deferred_hygiene",
+            &[
+                (
+                    "P/Ok.lean",
+                    "axiom allowedAx : True\ntheorem ok_thm : True := allowedAx\n",
+                ),
+                (
+                    "Extra/Sneak.lean",
+                    "axiom sneakForbidden : False\ntheorem bad_thm : False := sneakForbidden\n",
+                ),
+            ],
+        )?;
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tree.root)?;
+        let _bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy());
+        let prev_ax = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "allowedAx");
+        let run_res = (|| -> Result<()> {
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            for mode in ["trusted", "untrusted"] {
+                let err = run_ci_verify_command(
+                    &mut store,
+                    true,
+                    mode.into(),
+                    tree.project.clone(),
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .expect_err("ci-verify must reject non-DAG file containing disallowed axiom");
+                let msg = format!("{err:#}");
+                assert!(
+                    msg.contains("Extra/Sneak.lean") && msg.contains("axiom"),
+                    "mode={mode} unexpected error: {msg}"
+                );
+            }
+            fs::remove_file(tree.project.join("Extra/Sneak.lean"))?;
+            for mode in ["trusted", "untrusted"] {
+                run_ci_verify_command(
+                    &mut store,
+                    true,
+                    mode.into(),
+                    tree.project.clone(),
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .with_context(|| format!("ci-verify mode={mode} should accept DAG allowedAx"))?;
+            }
+            Ok(())
+        })();
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        run_res
     }
 }
