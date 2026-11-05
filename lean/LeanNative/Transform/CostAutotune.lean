@@ -74,9 +74,13 @@ def HardwareCostProfile.toJson (p : HardwareCostProfile) : String :=
     ("clz256_cost", p.clz256Cost), ("add_sub_checked256_cost", p.addSubChecked256Cost),
     ("mul_checked256_cost", p.mulChecked256Cost), ("min_gpu_elements", p.minGpuElements),
     ("gpu_block_threads", p.gpuBlockThreads), ("matmul_tile_dim", p.matmulTileDim)]
+  let selection := match p.keptSites? with
+    | none => []
+    | some sites => ["\"kept_sites\":[" ++ String.intercalate "," (sites.map fun (decl, site) =>
+        "{\"decl\":\"" ++ jsonEscape decl ++ "\",\"site\":" ++ toString site ++ "}") ++ "]"]
   "{" ++ String.intercalate "," (
     strings.map (fun (key, value) => "\"" ++ key ++ "\":\"" ++ jsonEscape value ++ "\"") ++
-    numbers.map (fun (key, value) => "\"" ++ key ++ "\":" ++ toString value)) ++ "}"
+    numbers.map (fun (key, value) => "\"" ++ key ++ "\":" ++ toString value) ++ selection) ++ "}"
 
 structure CorpusTimingSample where
   baselineNs : Nat
@@ -106,17 +110,18 @@ structure CandidateAblationSample where
   baselineNs : Nat
   soloCandidateNs : Nat
   hits : Nat := 1
+  workloadPairs : List (Nat × Nat) := []
   deriving Repr, DecidableEq, Inhabited, BEq
 
 def candidateAblationSurvives (s : CandidateAblationSample) : Bool :=
   s.hits > 0 && s.baselineNs > 0 && s.soloCandidateNs > 0 &&
-    meetsOnePercentE2EGain s.baselineNs s.soloCandidateNs
+    if s.workloadPairs.isEmpty then meetsOnePercentE2EGain s.baselineNs s.soloCandidateNs
+    else meetsCorpusGeomeanOnePercentGain (s.workloadPairs.map fun (b, c) =>
+      { baselineNs := b, candidateNs := c, hits := s.hits })
 
 def keepSiteByAblations (ablations : List CandidateAblationSample) (siteIdx : Nat) : Bool :=
-  if ablations.isEmpty then true
-  else
-    let matching := ablations.filter (fun s => s.siteIdx == siteIdx)
-    !matching.isEmpty && matching.all candidateAblationSurvives
+  let matching := ablations.filter (fun s => s.siteIdx == siteIdx)
+  !matching.isEmpty && matching.all candidateAblationSurvives
 
 def superoptCodeSelective (p : HardwareCostProfile) (targetLabel declName : String)
     (keepIdx : Nat → Bool) : LNIRCode → Nat → LNIRCode × List SuperoptRewriteRecord × Nat
@@ -170,18 +175,18 @@ def superoptCodeSelective (p : HardwareCostProfile) (targetLabel declName : Stri
 def superoptDeclSelective (p : HardwareCostProfile) (targetLabel : String)
     (keepIdx : Nat → Bool) (d : LNIRDecl) (nextIdx : Nat) :
     LNIRDecl × List SuperoptRewriteRecord × Nat :=
-  let (body', recs, nextIdx') := superoptCodeSelective p targetLabel d.name keepIdx d.body nextIdx
+  let (body', recs, count) := superoptCodeSelective p targetLabel d.name keepIdx d.body 0
   let assurance' :=
     if recs.isEmpty then d.assurance
     else AssuranceLevel.combine d.assurance .verifiedKernelProof
-  ({ d with body := body', assurance := assurance' }, recs, nextIdx')
+  ({ d with body := body', assurance := assurance' }, recs, nextIdx + count)
 
-def superoptModuleSelective (p : HardwareCostProfile) (keepIdx : Nat → Bool)
+def superoptModuleSelective (p : HardwareCostProfile) (keepIdx : String → Nat → Bool)
     (m : LNIRModule) : LNIRModule × SuperoptReport × Nat :=
   let targetLabel := s!"{p.target.toString}:{p.profileId}"
   let costBefore := m.decls.foldl (fun acc d => acc + codeScalarCostWithProfile p d.body) 0
   let (decls', allRecs, totalSites) := m.decls.foldl (fun (dAcc, rAcc, idx) d =>
-    let (d', recs, idx') := superoptDeclSelective p targetLabel keepIdx d idx
+    let (d', recs, idx') := superoptDeclSelective p targetLabel (keepIdx d.name) d idx
     (dAcc ++ [d'], rAcc ++ recs, idx')
   ) ([], [], 0)
   let m' : LNIRModule := { m with decls := decls' }
@@ -196,6 +201,14 @@ def superoptModuleSelective (p : HardwareCostProfile) (keepIdx : Nat → Bool)
     totalCostAfter := costAfter
     records := allRecs
   }, totalSites)
+
+def superoptModuleWithProfile (p : HardwareCostProfile) (m : LNIRModule) : LNIRModule × SuperoptReport :=
+  let (candidate, report, _) := superoptModuleSelective p
+    (fun decl idx => p.keptSites?.all (fun sites => sites.contains (decl, idx))) m
+  (candidate, report)
+
+def keepDeclSiteByAblations (ablations : List CandidateAblationSample) (decl : String) : Nat → Bool :=
+  keepSiteByAblations (ablations.filter (fun s => s.declName == decl))
 
 structure CalibrationReceipt where
   profile : HardwareCostProfile
@@ -231,10 +244,14 @@ def corpusCalibrationReceipt (p : HardwareCostProfile) (corpus : List CorpusTimi
 def pruneCandidatesByAblation (p : HardwareCostProfile) (corpus : List CorpusTimingSample)
     (m : LNIRModule) (ablations : List CandidateAblationSample := []) :
     LNIRModule × CalibrationReceipt :=
-  let keepIdx := keepSiteByAblations ablations
+  let keepIdx := keepDeclSiteByAblations ablations
   let (candidate, report, totalSites) := superoptModuleSelective p keepIdx m
   let pruned := totalSites - report.rewritesApplied
-  let receipt := corpusCalibrationReceipt p corpus report.rewritesApplied (some report) totalSites pruned
+  let sites := m.decls.flatMap fun d =>
+    let (_, _, count) := superoptDeclSelective p "" (fun _ => true) d 0
+    (List.range count).filterMap fun idx => if keepIdx d.name idx then some (d.name, idx) else none
+  let selected := { p with keptSites? := some sites }
+  let receipt := corpusCalibrationReceipt selected corpus report.rewritesApplied (some report) totalSites pruned
   (if receipt.accepted then candidate else m, receipt)
 
 def pruneCandidateByAmdahl (p : HardwareCostProfile) (corpus : List CorpusTimingSample)
@@ -247,19 +264,21 @@ def autotuneSuperoptModule (base : HardwareCostProfile) (samples : List OpTiming
     (ablations : List CandidateAblationSample := []) : LNIRModule × CalibrationReceipt :=
   let p := calibrateHardwareProfile base samples
   let (candidate, receipt) := pruneCandidatesByAblation p corpus m ablations
-  (candidate, { receipt with profile := if receipt.accepted then p else base })
+  (candidate, { receipt with profile :=
+    if receipt.accepted then receipt.profile else { base with keptSites? := some [] } })
 
 def autotuneDeclWithAmdahl (base : HardwareCostProfile) (samples : List OpTimingSample)
     (corpus : List CorpusTimingSample) (d : LNIRDecl)
     (ablations : List CandidateAblationSample := []) : LNIRDecl × CalibrationReceipt :=
   let p := calibrateHardwareProfile base samples
-  let declAblations := ablations.filter (fun s => s.declName.isEmpty || s.declName == d.name)
+  let declAblations := ablations.filter (fun s => s.declName == d.name)
   let keepIdx := keepSiteByAblations declAblations
   let (candidate, records, totalSites) :=
     superoptDeclSelective p s!"{p.target.toString}:{p.profileId}" keepIdx d 0
-  let timings := corpus.filter (fun s => s.declName.isEmpty || s.declName == d.name)
+  let declHits := (aggregateCorpusTimings (corpus.filter (fun s => s.declName == d.name))).hits
   let pruned := totalSites - records.length
-  let receipt := corpusCalibrationReceipt p timings records.length none totalSites pruned
+  let receipt := corpusCalibrationReceipt p corpus (if declHits > 0 then records.length else 0)
+    none totalSites pruned
   (if receipt.accepted then candidate else d,
     { receipt with profile := if receipt.accepted then p else base })
 
@@ -282,11 +301,11 @@ def calibrationPreset : String → Option HardwareCostProfile
 
 def autotuneCodeWithAmdahl (base : HardwareCostProfile) (samples : List OpTimingSample)
     (corpus : List CorpusTimingSample) (ablations : List CandidateAblationSample := [])
-    (c : LNIRCode) : LNIRCode :=
+    (c : LNIRCode) (declName : String := "autotune") : LNIRCode :=
   let p := calibrateHardwareProfile base samples
-  let keepIdx := keepSiteByAblations ablations
+  let keepIdx := keepDeclSiteByAblations ablations declName
   let (candidate, records, totalSites) :=
-    superoptCodeSelective p s!"{p.target.toString}:{p.profileId}" "autotune" keepIdx c 0
+    superoptCodeSelective p s!"{p.target.toString}:{p.profileId}" declName keepIdx c 0
   let pruned := totalSites - records.length
   let receipt := corpusCalibrationReceipt p corpus records.length none totalSites pruned
   if receipt.accepted then candidate else c

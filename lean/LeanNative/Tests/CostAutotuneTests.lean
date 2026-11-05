@@ -118,7 +118,7 @@ def evalDeclU64 (d : LNIRDecl) (a b c : UInt64) : Option UInt64 :=
         let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples falsePositiveCorpus fmaModule
         meetsOnePercentE2EGain totals.baselineNs totals.candidateNs == true &&
         meetsCorpusGeomeanOnePercentGain falsePositiveCorpus == false &&
-        r.accepted == false && m' == fmaModule && r.profile == sm90Preset)
+         r.accepted == false && m' == fmaModule && r.profile == { sm90Preset with keptSites? := some [] })
 
 #guard (let validGeomeanCorpus : List CorpusTimingSample :=
           [ { baselineNs := 1000, candidateNs := 980, hits := 1, declName := "k0" }
@@ -127,26 +127,55 @@ def evalDeclU64 (d : LNIRDecl) (a b c : UInt64) : Option UInt64 :=
 
 #guard (let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 990, hits := 1 }] fmaModule
-        r.accepted == true && m' != fmaModule && r.profile == calibrateHardwareProfile sm90Preset cudaHeavyFmaSamples)
+          [{ siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 980 }]
+        r.accepted == true && m' != fmaModule &&
+        r.profile == { calibrateHardwareProfile sm90Preset cudaHeavyFmaSamples with
+          keptSites? := some [("autotune_fma", 0)] })
 
 #guard (let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 991, hits := 1 }] fmaModule
-        r.accepted == false && m' == fmaModule && r.profile == sm90Preset)
+        r.accepted == false && m' == fmaModule && r.profile == { sm90Preset with keptSites? := some [] })
 
 #guard (let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 900, hits := 0 }] fmaModule
-        r.accepted == false && m' == fmaModule && r.profile == sm90Preset)
+        r.accepted == false && m' == fmaModule && r.profile == { sm90Preset with keptSites? := some [] })
 
 #guard (let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 900, hits := 1 }] noopModule
-        r.accepted == false && m' == noopModule && r.profile == sm90Preset)
+        r.accepted == false && m' == noopModule && r.profile == { sm90Preset with keptSites? := some [] })
 
 def fmaDecl2 : LNIRDecl := { fmaDecl with name := "autotune_fma_2" }
 def twoDeclMod : LNIRModule := { moduleName := "LeanNative.Tests.TwoSiteAblation", decls := [fmaDecl, fmaDecl2] }
 
+#guard (let ablations : List CandidateAblationSample :=
+          [{ siteIdx := 0, declName := fmaDecl.name, baselineNs := 1000, soloCandidateNs := 980 },
+           { siteIdx := 0, declName := fmaDecl2.name, baselineNs := 1000, soloCandidateNs := 995 }]
+        let (candidate, receipt) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
+          [{ baselineNs := 1000, candidateNs := 980, hits := 1 }] twoDeclMod ablations
+        match HardwareCostProfile.fromJson? receipt.profile.toJson with
+        | none => false
+        | some profile => receipt.accepted && (superoptModuleWithProfile profile twoDeclMod).1 == candidate &&
+            candidate.decls[1]! == fmaDecl2 && candidate.decls[0]! != fmaDecl)
+
+#guard !keepSiteByAblations [] 0
+#guard !candidateAblationSurvives {
+  siteIdx := 0, baselineNs := 10700, soloCandidateNs := 10400,
+  workloadPairs := (10000, 9000) :: List.replicate 7 (100, 200) }
+#guard !candidateAblationSurvives {
+  siteIdx := 0, baselineNs := 1000, soloCandidateNs := 900, hits := 0 }
+#guard !candidateAblationSurvives {
+  siteIdx := 0, baselineNs := 1000, soloCandidateNs := 900, workloadPairs := [(1000, 0)] }
+#guard candidateAblationSurvives {
+  siteIdx := 0, baselineNs := 1000, soloCandidateNs := 980,
+  workloadPairs := List.replicate 8 (1000, 980) }
+#guard (let pass := costAutotunePassFor sm90Preset cudaHeavyFmaSamples
+          [{ baselineNs := 1000, candidateNs := 980, hits := 1, declName := "autotune_fma" }]
+          [{ siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 980 }]
+        (pass.runDecl fmaDecl2).1 == fmaDecl2)
+
 #guard (let abls : List CandidateAblationSample :=
           [ { siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 980, hits := 1 }
-          , { siteIdx := 1, declName := "autotune_fma_2", baselineNs := 1000, soloCandidateNs := 995, hits := 1 } ]
+          , { siteIdx := 0, declName := "autotune_fma_2", baselineNs := 1000, soloCandidateNs := 995, hits := 1 } ]
         let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 985, hits := 1 }] twoDeclMod abls
         r.accepted == true && r.sitesConsidered == 2 && r.sitesPruned == 1 &&
@@ -157,7 +186,7 @@ def twoDeclMod : LNIRModule := { moduleName := "LeanNative.Tests.TwoSiteAblation
         let (m', r) := autotuneSuperoptModule sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 980, hits := 1 }] fmaModule allPrunedAbls
         r.accepted == false && r.sitesConsidered == 1 && r.sitesPruned == 1 &&
-        m' == fmaModule && r.profile == sm90Preset)
+        m' == fmaModule && r.profile == { sm90Preset with keptSites? := some [] })
 
 #guard (let m := mkCanonicalBenchmarkModule8
         let mutatedEvm := m.decls.map fun d =>
@@ -175,6 +204,7 @@ def twoDeclMod : LNIRModule := { moduleName := "LeanNative.Tests.TwoSiteAblation
 
 #guard (let (d', r) := autotuneDeclWithAmdahl sm90Preset cudaHeavyFmaSamples
           [{ baselineNs := 1000, candidateNs := 990, hits := 1, declName := "autotune_fma" }] fmaDecl
+          [{ siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 980 }]
         r.accepted == true &&
         evalDeclU64 fmaDecl 7 11 13 == evalDeclU64 d' 7 11 13 &&
         evalDeclU64 d' 7 11 13 == some 90)
@@ -183,7 +213,8 @@ def twoDeclMod : LNIRModule := { moduleName := "LeanNative.Tests.TwoSiteAblation
         cert.changed == false && d' == fmaDecl && cert.assurance == .verifiedKernelProof)
 
 #guard (let calPass := costAutotunePassFor sm90Preset cudaHeavyFmaSamples
-          [{ baselineNs := 1000, candidateNs := 990, hits := 1 }]
+          [{ baselineNs := 1000, candidateNs := 990, hits := 1, declName := "autotune_fma" }]
+          [{ siteIdx := 0, declName := "autotune_fma", baselineNs := 1000, soloCandidateNs := 980 }]
         let (d', cert) := calPass.runDecl fmaDecl
         cert.changed == true && d' != fmaDecl && cert.assurance == .verifiedKernelProof &&
         evalDeclU64 fmaDecl 7 11 13 == evalDeclU64 d' 7 11 13)

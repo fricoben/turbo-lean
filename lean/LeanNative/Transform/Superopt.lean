@@ -1,4 +1,5 @@
 import LeanNative.IR.Types
+import Lean.Data.Json
 import LeanNative.IR.AST
 import LeanNative.Semantics.Value
 import LeanNative.Semantics.Eval
@@ -73,6 +74,7 @@ structure HardwareCostProfile where
   minGpuElements       : Nat := 65536
   gpuBlockThreads      : Nat := 256
   matmulTileDim        : Nat := 16
+  keptSites?           : Option (List (String × Nat)) := none
   deriving Repr, DecidableEq, Inhabited, BEq
 
 namespace HardwareCostProfile
@@ -107,6 +109,18 @@ private def extractJsonNatField (raw : String) (key : String) : Option Nat := do
 
 /-- Parse a `HardwareCostProfile` from a `profiles/*.json` file. -/
 def fromJson? (raw : String) : Option HardwareCostProfile := do
+  let top ← (Lean.Json.parse raw).toOption
+  let obj := (top.getObjVal? "profile").toOption.getD top
+  let keptSites? ← match obj.getObjVal? "kept_sites" with
+    | .error _ => some none
+    | .ok value => do
+      let rows ← value.getArr?.toOption
+      let sites ← rows.toList.mapM fun row => do
+        let decl ← (← row.getObjVal? "decl" |>.toOption).getStr?.toOption
+        let site ← (← row.getObjVal? "site" |>.toOption).getNat?.toOption
+        return (decl, site)
+      some (some sites)
+  let raw := obj.compress
   let tgtStr := (extractJsonStringField raw "target").getD "x86_64"
   let target : SuperoptTarget :=
     if tgtStr == "arm64" || tgtStr == "aarch64" then .arm64
@@ -119,6 +133,7 @@ def fromJson? (raw : String) : Option HardwareCostProfile := do
   let sm := (extractJsonStringField raw "sm_arch").getD base.smArch
   return {
     profileId            := pid
+    keptSites?           := keptSites?
     target               := target
     llvmTargetCpu        := llvmCpu
     smArch               := sm
@@ -909,10 +924,6 @@ def superoptModuleCore (p : HardwareCostProfile) (targetLabel : String) (m : LNI
     optimized module along with a structured `SuperoptReport`. -/
 def superoptModule (target : SuperoptTarget) (m : LNIRModule) : LNIRModule × SuperoptReport :=
   superoptModuleCore (HardwareCostProfile.forTarget target) target.toString m
-
-/-- Superoptimize all declarations in an `LNIRModule` using a `HardwareCostProfile` (`profiles/*.json`). -/
-def superoptModuleWithProfile (p : HardwareCostProfile) (m : LNIRModule) : LNIRModule × SuperoptReport :=
-  superoptModuleCore p s!"{p.target.toString}:{p.profileId}" m
 
 private abbrev escapeJsonSO := LeanNative.IR.jsonEscape
 

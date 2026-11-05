@@ -297,15 +297,18 @@ def costAutotuneContract : VerifiedCodePassContract :=
 def costAutotunePassFor (base : HardwareCostProfile) (samples : List OpTimingSample)
     (corpus : List CorpusTimingSample) (ablations : List CandidateAblationSample := []) :
     TransformPass :=
-  TransformPass.ofVerifiedContract
-    (verifiedCostAutotuneContract base samples corpus ablations
-      (LeanNative.Proofs.autotuneCodeWithAmdahl_sound base samples corpus ablations))
+  TransformPass.ofVerifiedTransformContract {
+    name := "CostAutotune"
+    theoremRef := "LeanNative.Proofs.autotuneDeclWithAmdahl_sound"
+    notes := "Declaration-bound calibration and ablation evidence"
+    run := fun d => (autotuneDeclWithAmdahl base samples corpus d ablations).1
+    sound := fun d => LeanNative.Proofs.autotuneDeclWithAmdahl_sound base samples corpus d ablations }
 
 def costAutotunePass : TransformPass :=
   TransformPass.ofVerifiedContract costAutotuneContract
 
 def verifiedKernelPasses : List TransformPass :=
-  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass, costAutotunePass]
+  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass]
 
 /-- Extended TV-validated pass pipeline (`UnboxTupleSROA`, `HoistExclusivity`, `LoopVectorizeOpt`,
     and extended `AlgebraicOpt` rules gated by `SymbolicTV.validateTranslationDecl`). -/

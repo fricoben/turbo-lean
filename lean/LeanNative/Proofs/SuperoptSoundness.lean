@@ -678,9 +678,4 @@ theorem superoptModule_sound (target : SuperoptTarget) (m : LNIRModule) :
     ∀ d ∈ m.decls, ∃ d' ∈ (superoptModule target m).1.decls, CodeRefines d.body d'.body :=
   superoptModuleCore_sound (HardwareCostProfile.forTarget target) target.toString m
 
-/-- Profile-guided module-level superoptimizer soundness (`superoptModuleWithProfile_sound`). -/
-theorem superoptModuleWithProfile_sound (p : HardwareCostProfile) (m : LNIRModule) :
-    ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleWithProfile p m).1.decls, CodeRefines d.body d'.body :=
-  superoptModuleCore_sound p s!"{p.target.toString}:{p.profileId}" m
-
 end LeanNative.Proofs

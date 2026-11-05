@@ -54,13 +54,6 @@ theorem meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive :
     meetsCorpusGeomeanOnePercentGain corpus = false := by
   decide
 
-theorem superoptModuleWithCalibratedProfile_sound (base : HardwareCostProfile)
-    (samples : List OpTimingSample) (m : LNIRModule) :
-    ∀ d ∈ m.decls,
-      ∃ d' ∈ (superoptModuleWithProfile (calibrateHardwareProfile base samples) m).1.decls,
-        CodeRefines d.body d'.body :=
-  superoptModuleWithProfile_sound (calibrateHardwareProfile base samples) m
-
 theorem superoptCodeSelective_sound (p : HardwareCostProfile) (targetLabel declName : String)
     (keepIdx : Nat → Bool) (code : LNIRCode) (nextIdx : Nat) :
     CodeRefines code (superoptCodeSelective p targetLabel declName keepIdx code nextIdx).1 := by
@@ -180,29 +173,29 @@ theorem superoptDeclSelective_sound (p : HardwareCostProfile) (targetLabel : Str
     (keepIdx : Nat → Bool) (d : LNIRDecl) (nextIdx : Nat) :
     CodeRefines d.body (superoptDeclSelective p targetLabel keepIdx d nextIdx).1.body := by
   unfold superoptDeclSelective
-  exact superoptCodeSelective_sound p targetLabel d.name keepIdx d.body nextIdx
+  exact superoptCodeSelective_sound p targetLabel d.name keepIdx d.body 0
 
 private theorem foldl_selective_decls_mem_acc (p : HardwareCostProfile) (targetLabel : String)
-    (keepIdx : Nat → Bool) (ds : List LNIRDecl) (dAcc : List LNIRDecl)
+    (keepIdx : String → Nat → Bool) (ds : List LNIRDecl) (dAcc : List LNIRDecl)
     (rAcc : List SuperoptRewriteRecord) (idx : Nat) (x : LNIRDecl) (hx : x ∈ dAcc) :
     x ∈ (ds.foldl (fun (accD, accR, curIdx) d =>
-      let (d', recs, nextIdx) := superoptDeclSelective p targetLabel keepIdx d curIdx
+      let (d', recs, nextIdx) := superoptDeclSelective p targetLabel (keepIdx d.name) d curIdx
       (accD ++ [d'], accR ++ recs, nextIdx)) (dAcc, rAcc, idx)).1 := by
   induction ds generalizing dAcc rAcc idx with
   | nil => exact hx
   | cons d0 rest ih =>
     simp only [List.foldl]
     exact ih
-      (dAcc ++ [(superoptDeclSelective p targetLabel keepIdx d0 idx).1])
-      (rAcc ++ (superoptDeclSelective p targetLabel keepIdx d0 idx).2.1)
-      (superoptDeclSelective p targetLabel keepIdx d0 idx).2.2
+      (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
+      (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
+      (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.2
       (List.mem_append_left _ hx)
 
 private theorem foldl_selective_decls_refines (p : HardwareCostProfile) (targetLabel : String)
-    (keepIdx : Nat → Bool) (ds : List LNIRDecl) (dAcc : List LNIRDecl)
+    (keepIdx : String → Nat → Bool) (ds : List LNIRDecl) (dAcc : List LNIRDecl)
     (rAcc : List SuperoptRewriteRecord) (idx : Nat) :
     ∀ d ∈ ds, ∃ d' ∈ (ds.foldl (fun (accD, accR, curIdx) d =>
-      let (d', recs, nextIdx) := superoptDeclSelective p targetLabel keepIdx d curIdx
+      let (d', recs, nextIdx) := superoptDeclSelective p targetLabel (keepIdx d.name) d curIdx
       (accD ++ [d'], accR ++ recs, nextIdx)) (dAcc, rAcc, idx)).1,
       CodeRefines d.body d'.body := by
   intro d hd
@@ -213,21 +206,21 @@ private theorem foldl_selective_decls_refines (p : HardwareCostProfile) (targetL
     cases hd with
     | inl heq =>
       subst d
-      refine ⟨(superoptDeclSelective p targetLabel keepIdx d0 idx).1, ?_,
-        superoptDeclSelective_sound p targetLabel keepIdx d0 idx⟩
+      refine ⟨(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1, ?_,
+        superoptDeclSelective_sound p targetLabel (keepIdx d0.name) d0 idx⟩
       exact foldl_selective_decls_mem_acc p targetLabel keepIdx rest
-        (dAcc ++ [(superoptDeclSelective p targetLabel keepIdx d0 idx).1])
-        (rAcc ++ (superoptDeclSelective p targetLabel keepIdx d0 idx).2.1)
-        (superoptDeclSelective p targetLabel keepIdx d0 idx).2.2
-        (superoptDeclSelective p targetLabel keepIdx d0 idx).1
+        (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
+        (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
+        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.2
+        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1
         (List.mem_append_right _ (List.mem_singleton.mpr rfl))
     | inr hmem =>
       exact ih
-        (dAcc ++ [(superoptDeclSelective p targetLabel keepIdx d0 idx).1])
-        (rAcc ++ (superoptDeclSelective p targetLabel keepIdx d0 idx).2.1)
-        (superoptDeclSelective p targetLabel keepIdx d0 idx).2.2 hmem
+        (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
+        (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
+        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.2 hmem
 
-theorem superoptModuleSelective_sound (p : HardwareCostProfile) (keepIdx : Nat → Bool)
+theorem superoptModuleSelective_sound (p : HardwareCostProfile) (keepIdx : String → Nat → Bool)
     (m : LNIRModule) :
     ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleSelective p keepIdx m).1.decls,
       CodeRefines d.body d'.body := by
@@ -236,10 +229,23 @@ theorem superoptModuleSelective_sound (p : HardwareCostProfile) (keepIdx : Nat �
   exact foldl_selective_decls_refines p s!"{p.target.toString}:{p.profileId}"
     keepIdx m.decls [] [] 0 d hd
 
+theorem superoptModuleWithProfile_sound (p : HardwareCostProfile) (m : LNIRModule) :
+    ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleWithProfile p m).1.decls, CodeRefines d.body d'.body := by
+  unfold superoptModuleWithProfile
+  exact superoptModuleSelective_sound p
+    (fun decl idx => p.keptSites?.all (fun sites => sites.contains (decl, idx))) m
+
+theorem superoptModuleWithCalibratedProfile_sound (base : HardwareCostProfile)
+    (samples : List OpTimingSample) (m : LNIRModule) :
+    ∀ d ∈ m.decls,
+      ∃ d' ∈ (superoptModuleWithProfile (calibrateHardwareProfile base samples) m).1.decls,
+        CodeRefines d.body d'.body :=
+  superoptModuleWithProfile_sound (calibrateHardwareProfile base samples) m
+
 theorem autotuneCodeWithAmdahl_sound (base : HardwareCostProfile)
     (samples : List OpTimingSample) (corpus : List CorpusTimingSample)
-    (ablations : List CandidateAblationSample := []) (c : LNIRCode) :
-    CodeRefines c (autotuneCodeWithAmdahl base samples corpus ablations c) := by
+    (ablations : List CandidateAblationSample := []) (c : LNIRCode) (declName : String := "autotune") :
+    CodeRefines c (autotuneCodeWithAmdahl base samples corpus ablations c declName) := by
   unfold autotuneCodeWithAmdahl
   dsimp only []
   split
@@ -258,9 +264,12 @@ theorem autotuneDeclWithAmdahl_sound (base : HardwareCostProfile)
     CodeRefines d.body (autotuneDeclWithAmdahl base samples corpus d ablations).1.body := by
   unfold autotuneDeclWithAmdahl
   dsimp only []
-  split
-  · exact superoptDeclSelective_sound _ _ _ d 0
-  · exact CodeRefines.refl _
+  have gate (accept : Bool) (candidate : LNIRDecl) (h : CodeRefines d.body candidate.body) :
+      CodeRefines d.body (if accept then candidate else d).body := by
+    cases accept
+    · exact CodeRefines.refl _
+    · exact h
+  exact gate _ _ (superoptDeclSelective_sound _ _ _ d 0)
 
 theorem autotuneSuperoptModule_sound (base : HardwareCostProfile)
     (samples : List OpTimingSample) (corpus : List CorpusTimingSample) (m : LNIRModule)
@@ -272,7 +281,7 @@ theorem autotuneSuperoptModule_sound (base : HardwareCostProfile)
   dsimp only []
   split
   · exact superoptModuleSelective_sound (calibrateHardwareProfile base samples)
-      (keepSiteByAblations ablations) m d hd
+      (keepDeclSiteByAblations ablations) m d hd
   · exact ⟨d, hd, CodeRefines.refl _⟩
 
 theorem costAutotune_amdahl_gate_nonvacuous :
@@ -286,11 +295,13 @@ theorem costAutotune_amdahl_gate_nonvacuous :
     let m : LNIRModule := { moduleName := "amdahl", decls := [d] }
     let good := autotuneSuperoptModule base []
       [CorpusTimingSample.mk 1000 990 1 ""] m
+      [{ siteIdx := 0, declName := "fma", baselineNs := 1000, soloCandidateNs := 980 }]
     let bad := autotuneSuperoptModule base []
       [CorpusTimingSample.mk 1000 991 1 ""] m
+      [{ siteIdx := 0, declName := "fma", baselineNs := 1000, soloCandidateNs := 980 }]
     let ablatedReject := autotuneSuperoptModule base []
       [CorpusTimingSample.mk 1000 990 1 ""] m
-      [CandidateAblationSample.mk 0 "fma" 1000 995 1]
+      [CandidateAblationSample.mk 0 "fma" 1000 995 1 []]
     scalarExprCostWithProfile p fused < scalarExprCostWithProfile p e ∧
     good.2.accepted = true ∧
     bad.2.accepted = false ∧
@@ -298,9 +309,9 @@ theorem costAutotune_amdahl_gate_nonvacuous :
     good.1.decls.map (·.body) = [.letBind 3 .i64 (.scalar fused) (.ret 3)] ∧
     bad.1 = m ∧
     ablatedReject.1 = m ∧
-    good.2.profile = p ∧
-    bad.2.profile = base ∧
-    ablatedReject.2.profile = base ∧
+    good.2.profile.keptSites? = some [("fma", 0)] ∧
+    bad.2.profile = { base with keptSites? := some [] } ∧
+    ablatedReject.2.profile = { base with keptSites? := some [] } ∧
     good.2.report.map (·.rewritesApplied) = some 1 ∧
     bad.2.report.map (·.rewritesApplied) = some 1 ∧
     ablatedReject.2.sitesPruned = 1 := by
@@ -380,16 +391,17 @@ theorem costAutotune_amdahl_gate_nonvacuous :
         toString (HardwareCostProfile.forTarget .x86_64).profileId =
         lbl := rfl
   rcases hso lbl with ⟨r, hr⟩
+  rcases hso "" with ⟨r0, hr0⟩
   have hcodeKeep :
       superoptCodeSelective (HardwareCostProfile.forTarget .x86_64) lbl "fma"
-        (keepSiteByAblations [])
+        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 980 1 []])
         (.letBind 3 .i64 (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3)) 0 =
       (.letBind 3 .i64 (.scalar (.fma (.var 0) (.var 1) (.var 2))) (.ret 3), [r], 1) := by
     rw [superoptCodeSelective, hr]
-    simp [superoptCodeSelective, keepSiteByAblations]
+    simp [superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives, meetsOnePercentE2EGain]
   have hcodePrune :
       superoptCodeSelective (HardwareCostProfile.forTarget .x86_64) lbl "fma"
-        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1])
+        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1 []])
         (.letBind 3 .i64 (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3)) 0 =
       (.letBind 3 .i64 (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3), [], 1) := by
     rw [superoptCodeSelective, hr]
@@ -401,7 +413,7 @@ theorem costAutotune_amdahl_gate_nonvacuous :
         (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2)) := by decide
   have hdeclKeep :
       superoptDeclSelective (HardwareCostProfile.forTarget .x86_64) lbl
-        (keepSiteByAblations [])
+        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 980 1 []])
         { name := "fma", params := [], retTy := .i64,
           body := .letBind 3 .i64
             (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3) } 0 =
@@ -414,7 +426,7 @@ theorem costAutotune_amdahl_gate_nonvacuous :
     rfl
   have hdeclPrune :
       superoptDeclSelective (HardwareCostProfile.forTarget .x86_64) lbl
-        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1])
+        (keepSiteByAblations [CandidateAblationSample.mk 0 "fma" 1000 995 1 []])
         { name := "fma", params := [], retTy := .i64,
           body := .letBind 3 .i64
             (.scalar (.binOp .add (.binOp .mul (.var 0) (.var 1)) (.var 2))) (.ret 3) } 0 =
@@ -430,9 +442,13 @@ theorem costAutotune_amdahl_gate_nonvacuous :
   simp only [autotuneSuperoptModule, hp]
   simp only [pruneCandidatesByAblation, superoptModuleSelective,
     List.foldl, List.nil_append, hlbl]
+  simp only [keepDeclSiteByAblations, List.filter_cons, List.filter_nil, beq_self_eq_true,
+    ite_true]
   rw [hdeclKeep, hdeclPrune]
   simp [corpusCalibrationReceipt, meetsCorpusGeomeanOnePercentGain,
-    corpusProdBaseline, corpusProdCandidate, aggregateCorpusTimings, hcost]
+    corpusProdBaseline, corpusProdCandidate, aggregateCorpusTimings, hcost,
+    superoptDeclSelective, superoptCodeSelective, keepSiteByAblations, candidateAblationSurvives,
+    meetsOnePercentE2EGain, hlbl, hr, hr0]
 
 
 end LeanNative.Proofs

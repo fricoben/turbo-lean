@@ -106,17 +106,23 @@ private def parseCorpusEntry (j : Json) : Except String CorpusTimingSample := do
 private def parseAblationEntry (j : Json) : Except String CandidateAblationSample := do
   let fields ← j.getObj?
   let keys := fields.foldl (fun acc k _ => k :: acc) ([] : List String)
-  if keys.length != 5 ||
-      !(keys.all (["siteIdx", "declName", "baselineNs", "soloCandidateNs", "hits"].contains ·)) then
-    throw "ablation entry must contain exactly siteIdx, declName, baselineNs, soloCandidateNs, hits"
+  if !(keys.all (["siteIdx", "declName", "baselineNs", "soloCandidateNs", "hits", "workloadPairs"].contains ·)) then
+    throw "unknown ablation entry field"
   let siteIdx ← nonNegNat (← j.getObjVal? "siteIdx") "siteIdx must be a non-negative integer"
   let declName ← (← j.getObjVal? "declName").getStr?
   if !declName.isEmpty && !canonicalCorpusDeclNames.contains declName then
     throw s!"unknown canonical corpus declaration '{declName}' in ablation"
   let baselineNs ← positiveNat (← j.getObjVal? "baselineNs")
   let soloCandidateNs ← positiveNat (← j.getObjVal? "soloCandidateNs")
-  let hits ← positiveNat (← j.getObjVal? "hits")
-  return { siteIdx, declName, baselineNs, soloCandidateNs, hits }
+  let hits ← nonNegNat (← j.getObjVal? "hits") "hits must be a non-negative integer"
+  let workloadPairs ← if keys.contains "workloadPairs" then do
+    let rows ← (← j.getObjVal? "workloadPairs").getArr?
+    rows.toList.mapM fun row => do
+      let b ← positiveNat (← row.getObjVal? "baselineNs")
+      let c ← positiveNat (← row.getObjVal? "soloCandidateNs")
+      return (b, c)
+    else pure []
+  return { siteIdx, declName, baselineNs, soloCandidateNs, hits, workloadPairs }
 
 private def validateAllCanonicalDecls (entries : List CorpusTimingSample) : Except String Unit := do
   if entries.length != canonicalCorpusDeclNames.length then
@@ -147,7 +153,11 @@ def parseCorpusBundle (raw : String) :
       if keys.contains "ablations" then do
         let aRows ← (← top.getObjVal? "ablations").getArr?
         let abls ← aRows.toList.mapM parseAblationEntry
-        pure (abls, 1 + aRows.size * 5)
+        let pairFields := aRows.toList.foldl (fun n row =>
+          match row.getObjVal? "workloadPairs" with
+          | .ok pairs => n + 1 + (pairs.getArr?.toOption.getD #[]).size * 2
+          | .error _ => n) 0
+        pure (abls, 1 + aRows.size * 5 + pairFields)
       else pure ([], 0)
     let expectedFields := 1 + cRows.size * 4 + abFields
     if fieldCount raw != expectedFields then throw "duplicate corpus/ablation fields are forbidden"
@@ -289,7 +299,7 @@ private def digestDeclResult (v : Val) (st : HeapState) : Except String UInt64 :
   | .u256 w => return w.lo0 ^^^ w.lo1 ^^^ w.hi0 ^^^ w.hi1
   | .sarrayId bid =>
     match st.findBuffer bid with
-    | some buf => return buf.data.foldl (fun acc x => acc * 1099511628211 + x) 14695981039346656037
+    | some buf => return buf.data.foldl (fun acc x => (acc ^^^ x) * 1099511628211) 14695981039346656037
     | none => throw s!"missing output buffer {bid}"
   | _ => throw "unexpected return value kind in canonical corpus"
 
@@ -312,8 +322,8 @@ def verifyAndAccumulateCorpus (baseMod candMod : LNIRModule) (iters : Nat) :
         let hc ← digestDeclResult vc stc
         if hb != hc then
           throw s!"canonical corpus evaluation diverged on {db.name} at iter {iterIdx}"
-        checksumB := checksumB * 1099511628211 + hb + iterU64
-        checksumC := checksumC * 1099511628211 + hc + iterU64
+        checksumB := ((checksumB ^^^ hb) * 1099511628211 ^^^ iterU64) * 1099511628211
+        checksumC := ((checksumC ^^^ hc) * 1099511628211 ^^^ iterU64) * 1099511628211
       | _, _ =>
         throw s!"canonical corpus evaluation failed on {db.name} at iter {iterIdx}"
   if checksumB != checksumC then
@@ -396,7 +406,7 @@ static uint64_t hash_sarray(void *p) {
   uint64_t *raw = (uint64_t *)p;
   size_t n = (size_t)raw[1];
   uint64_t h = 14695981039346656037ULL;
-  for (size_t i = 0; i < n; ++i) h = h * 1099511628211ULL + raw[3 + i];
+  for (size_t i = 0; i < n; ++i) h = (h ^ raw[3 + i]) * 1099511628211ULL;
   return h;
 }
 
@@ -407,6 +417,36 @@ static uint64_t now_ns(void) {
 }
 
 int main(void) {
+  uint64_t parity = 14695981039346656037ULL;
+  for (uint64_t seed = 0; seed < 4; ++seed) {
+    uint64_t results[8];
+    results[0] = collatz_steps(17 + (seed & 7), 16);
+    results[1] = tuple_accum_sum(16, seed + 1);
+    for (int k = 2; k < 6; ++k) {
+      void *a = alloc_sarray(4, 0), *b = alloc_sarray(4, 0), *c = alloc_sarray(4, 0);
+      for (int i = 0; i < 4; ++i) {
+        ((uint64_t *)a)[3+i] = seed + 1 + i * (k == 2 ? 2 : 1);
+        ((uint64_t *)b)[3+i] = (k == 5 ? 3 : 2) + 2*i;
+        ((uint64_t *)c)[3+i] = 1;
+      }
+      void *out = k == 2 ? sarray_scale_bias(a, 3, 5) :
+        k == 3 ? dot_product_u64(a, b) : k == 4 ? saxpy_kernel(a, b) : matmul_tiled_u64(a, b, c);
+      results[k] = hash_sarray(out);
+      if (out != a && out != b && out != c) free(out);
+      free(a); free(b); free(c);
+    }
+    evm_map_t mp = { .keys = {10, 20}, .vals = {1000, 250}, .len = 2 };
+    u256_t words[2] = {
+      evm_erc20_transfer_u256(&mp, 10, 20, 5 + (seed & 3)),
+      evm_muldiv_wad_u256(1000 + (seed & 15), 3000, 100)
+    };
+    for (int i = 0; i < 2; ++i) {
+      u256_t w = words[i];
+      results[6+i] = (uint64_t)w ^ (uint64_t)(w >> 64) ^ (uint64_t)(w >> 128) ^ (uint64_t)(w >> 192);
+    }
+    for (int i = 0; i < 8; ++i) parity = (((parity ^ results[i]) * 1099511628211ULL) ^ seed) * 1099511628211ULL;
+  }
+  printf(\"PARITY_HASH %llu\\n\", (unsigned long long)parity);
   const size_t N = 256;
   uint64_t total_hash = 14695981039346656037ULL;
 
@@ -564,10 +604,13 @@ entry:
       throw <| IO.userError s!"compiled corpus execution failed: {exec.stderr.trimAscii.toString}"
     let mut timings : List (String × Nat) := []
     let mut checksum? : Option UInt64 := none
+    let mut parity? : Option UInt64 := none
     for rawLine in exec.stdout.splitOn "\n" do
       let line := rawLine.trimAscii.toString
       if !line.isEmpty then
         match line.splitOn " " with
+        | ["PARITY_HASH", vStr] =>
+          parity? := vStr.toNat?.map Nat.toUInt64
         | ["CHECKSUM", vStr] =>
           match vStr.toNat? with
           | some n => checksum? := some n.toUInt64
@@ -579,6 +622,11 @@ entry:
         | _ => throw <| IO.userError s!"unexpected harness output '{line}'"
     let some cs := checksum?
       | throw <| IO.userError "compiled corpus harness missing CHECKSUM"
+    let (expectedParity, _) ← IO.ofExcept (verifyAndAccumulateCorpus mod mod 4)
+    if parity? != some expectedParity then
+      throw <| IO.userError s!"native/evalCode parity mismatch for {tag}"
+    if timings.map Prod.fst != canonicalCorpusDeclNames then
+      throw <| IO.userError "compiled corpus harness declaration order mismatch"
     if timings.length != canonicalCorpusDeclNames.length then
       throw <| IO.userError s!"compiled corpus harness expected 8 timings, got {timings.length}"
     removeIfExists llPath
@@ -598,29 +646,31 @@ private def measureCompiledNativeCorpus (profile : HardwareCostProfile) (hostArc
     IO (List CorpusTimingSample × List CandidateAblationSample) := do
   let hostArch : TargetArch := if hostArchStr == "aarch64" || hostArchStr == "arm64" then .arm64 else .x86_64
   let m := mkCanonicalBenchmarkModule8
-  let (fullCand, _, totalSites) := superoptModuleSelective profile (fun _ => true) m
+  let (fullCand, _, _) := superoptModuleSelective profile (fun _ _ => true) m
   let _ ← IO.ofExcept (verifyAndAccumulateCorpus m fullCand 4)
   let (baseTimings, baseHash) ← compileAndRunModuleHarness m hostArch "base"
   let baseTotal := baseTimings.foldl (fun acc (_, ns) => acc + ns) 0
   let mut ablations : List CandidateAblationSample := []
-  for siteIdx in [:totalSites] do
-    let (soloMod, soloReport, _) := superoptModuleSelective profile (fun idx => idx == siteIdx) m
+  let sites := m.decls.flatMap fun d =>
+    let (_, _, count) := superoptDeclSelective profile "" (fun _ => true) d 0
+    (List.range count).map (d.name, ·)
+  for (siteDecl, siteIdx) in sites do
+    let (soloMod, soloReport, _) := superoptModuleSelective profile
+      (fun decl idx => decl == siteDecl && idx == siteIdx) m
     let _ ← IO.ofExcept (verifyAndAccumulateCorpus m soloMod 2)
     let (soloTimings, soloHash) ← compileAndRunModuleHarness soloMod hostArch s!"site{siteIdx}"
     if soloHash != baseHash then
       throw <| IO.userError s!"compiled ablation checksum mismatch at site {siteIdx}"
     let soloTotal := soloTimings.foldl (fun acc (_, ns) => acc + ns) 0
-    let siteDecl := match soloReport.records.head? with
-      | some r => r.declName
-      | none => ""
     ablations := ablations ++ [{
       siteIdx := siteIdx
       declName := siteDecl
       baselineNs := max 1 baseTotal
       soloCandidateNs := max 1 soloTotal
-      hits := max 1 soloReport.rewritesApplied
+      hits := soloReport.rewritesApplied
+      workloadPairs := baseTimings.zip soloTimings |>.map (fun ((_, b), (_, c)) => (b, c))
     }]
-  let keepIdx := keepSiteByAblations ablations
+  let keepIdx := keepDeclSiteByAblations ablations
   let (prunedMod, prunedReport, _) := superoptModuleSelective profile keepIdx m
   let _ ← IO.ofExcept (verifyAndAccumulateCorpus m prunedMod 4)
   let (candTimings, candHash) ← compileAndRunModuleHarness prunedMod hostArch "cand"
@@ -632,13 +682,11 @@ private def measureCompiledNativeCorpus (profile : HardwareCostProfile) (hostArc
       | some (_, v) => v
       | none => bNs
     let dHits := countDeclHits prunedReport.records dName
-    let effHits := if dHits > 0 then dHits else if prunedReport.rewritesApplied > 0 then 1 else 0
     corpus := corpus ++ [{
       declName := dName
       baselineNs := bNs
       candidateNs := cNs
-      hits := if dName == canonicalCorpusDeclNames.headD "" && prunedReport.rewritesApplied > 0 &&
-        (canonicalCorpusDeclNames.all (fun nm => countDeclHits prunedReport.records nm == 0)) then effHits else dHits
+      hits := dHits
     }]
   return (corpus, ablations)
 
@@ -672,7 +720,7 @@ def run (args : List String) : IO UInt32 := do
     let (corpus, ablations, provExtra) ← match opts.corpusPath with
       | some cPath => do
         let (cEntries, cAblations) ← IO.ofExcept (parseCorpusBundle (← IO.FS.readFile cPath))
-        let (candMod, _, _) := superoptModuleSelective profile (keepSiteByAblations cAblations) mkCanonicalBenchmarkModule8
+        let (candMod, _, _) := superoptModuleSelective profile (keepDeclSiteByAblations cAblations) mkCanonicalBenchmarkModule8
         let _ ← IO.ofExcept (verifyAndAccumulateCorpus mkCanonicalBenchmarkModule8 candMod 4)
         pure (cEntries, cAblations, [
           ("canonicalCorpusExecuted", .bool true),
