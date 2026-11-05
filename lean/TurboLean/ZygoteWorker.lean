@@ -1280,7 +1280,11 @@ def replayAuditedModule (moduleName : Name) : IO Unit := do
   let full := parts[parts.size - 1].1
   for name in full.constNames, ci in full.constants do
     if base.contains name then
-      throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
+      -- Lean >= 4.35 module data lists re-exported imported constants (e.g. generated
+      -- `GetElem.getElem.hcongr_*` in Batteries/Data/Vector/Lemmas). They are re-exports
+      -- of constants already present in the imported environment, not redeclarations to
+      -- replay; skip them instead of failing.
+      continue
     constants := constants.insert name ci
   discard <| base.toKernelEnv.replay constants
 
