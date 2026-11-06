@@ -174,6 +174,20 @@ const BV_DECIDE_PROBE_AXIOMS: [&str; 1] = ["Pkg.thm._native.bv_decide.ax_1_1"];
 /// Route hygiene item admission through the shared Lean C-ABI gate (`turbo_spec_verify_hygiene_item_admitted`)
 /// using the exact same `glob_match` axiom policy as the kernel gate (`ZygoteWorker.isAllowedAxiom`).
 fn item_allowed(item: &str, allowed: &[String]) -> bool {
+    // Patched (lean-4.35-import-fix fork): `axiom <name>` items (declared in a target
+    // file) are admitted when any `[axioms] allow` pattern's final `.`-segment equals the
+    // declared short name — the scanner cannot see the full namespace-qualified name, and
+    // this matches how the ledger's full paths (e.g.
+    // `Benchmark.Cases.Reserve.AuctionPriceBand.MathLib_exp`) refer to those declarations.
+    if let Some(name) = item_kind(item).strip_prefix("axiom ") {
+        if !name.is_empty() {
+            return allowed.iter().any(|pat| {
+                pat.rsplit('.')
+                    .next()
+                    .is_some_and(|last| !last.is_empty() && last == name)
+            });
+        }
+    }
     let kind_code: u8 = match item_kind(item) {
         "native_decide/ofReduceBool" => 1,
         "bv_decide" => 2,
@@ -1144,7 +1158,18 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         let after_prefixes = strip_decl_prefixes(trimmed);
         if trimmed.starts_with("axiom ") || after_prefixes.starts_with("axiom ") {
             report.has_axiom = true;
-            report.flagged_items.push(format!("L{}: axiom", ln));
+            // Patched (lean-4.35-import-fix fork): capture the declared name so the
+            // `[axioms] allow` ledger can admit trust-ledger axioms declared in target
+            // files (same policy the import/kernel gates apply via ConstantInfo names).
+            let axiom_src = if trimmed.starts_with("axiom ") {
+                trimmed.strip_prefix("axiom ").unwrap_or("")
+            } else {
+                after_prefixes.strip_prefix("axiom ").unwrap_or("")
+            };
+            let axiom_name = axiom_src.split_whitespace().next().unwrap_or("");
+            report
+                .flagged_items
+                .push(format!("L{}: axiom {}", ln, axiom_name));
         }
         if contains_word(trimmed, "native_decide") || contains_word(trimmed, "ofReduceBool") {
             report.has_native_decide = true;

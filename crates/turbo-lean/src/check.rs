@@ -2220,11 +2220,19 @@ fn check_directory(
     let mut all_shard_keys = Vec::new();
 
     for (lf, src_blake3, src, split) in split_entries {
+        // Patched (lean-4.35-import-fix fork): apply the project's `[axioms] allow` ledger to
+        // target files as well, mirroring the import-audit path (`disallowed_items_under`).
+        // Trust-ledger projects (e.g. ethereum-verification-benchmark's trusted-axioms.json:
+        // Reserve PRBMath oracles, Hypernova keccak/EIP-712 oracles) declare their axioms in
+        // Contract modules; without this, files that Lake accepts are un-checkable while the
+        // identical axiom USES in imports are admitted. Non-allowlisted axioms, `unsafe`,
+        // `sorry`, weakening options etc. remain blocking.
+        let hygiene_items = split.hygiene.disallowed_items_under(&splitter::allowed_axioms());
         anyhow::ensure!(
-            !split.hygiene.has_checking_weakening,
+            hygiene_items.is_empty(),
             "Soundness hygiene violation in {}: {:?}",
             lf.display(),
-            split.hygiene.disallowed_items()
+            hygiene_items
         );
         let rel = lf.strip_prefix(canon_dir).unwrap_or(&lf);
         dir_hasher.update(rel.to_string_lossy().as_bytes());
@@ -2989,11 +2997,14 @@ fn check_single_decl(
             split.shards[shard_idx].proof_text = prf;
         }
     }
+    // Patched (lean-4.35-import-fix fork): same `[axioms] allow` ledger filtering as above,
+    // for the single-declaration check path.
+    let hygiene_items = split.hygiene.disallowed_items_under(&splitter::allowed_axioms());
     anyhow::ensure!(
-        !split.hygiene.has_checking_weakening,
+        hygiene_items.is_empty(),
         "Soundness hygiene violation in {}: {:?}",
         active_file.display(),
-        split.hygiene.disallowed_items()
+        hygiene_items
     );
     // Every verdict, receipt and cache entry carries the resolved full Lean name.
     let resolved_decl = split.shards[shard_idx].decl_name().to_string();
